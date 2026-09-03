@@ -18,7 +18,7 @@ We welcome **any and all suggestions and comments** via [GitHub Issues](../../is
 
 | Path | Description |
 |------|-------------|
-| [Support/EncDec.py](Support/EncDec.py) | Mesh encryption construction (AES-GCM + HKDF); placeholder secrets only |
+| [Support/EncDec.py](Support/EncDec.py) | Mesh encryption (AES-256-GCM + HKDF-SHA512): legacy / v2 / v3 / ECDH wire formats, local-at-rest, chunk DEK wrapping; placeholder secrets only |
 | [standards/nprc-v1/](standards/nprc-v1/) | **NPRC-1** - Neuron Peer Reliability Certificate (signed P2P trust) |
 
 ### NPRC-1 quick start
