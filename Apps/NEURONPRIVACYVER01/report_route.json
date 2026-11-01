@@ -1,0 +1,6 @@
+{
+  "prefer": "p2p",
+  "peer_handle": "AAAAA",
+  "mailto": "neuron-helpdesk@proton.me",
+  "note": "peer_handle is a mesh node id (not an IP). P2P uses Neuron routing; mailto is fallback if the helpdesk peer is unreachable. Helpdesk-only reports may include source endpoints for investigation; the on-screen UI never shows them."
+}

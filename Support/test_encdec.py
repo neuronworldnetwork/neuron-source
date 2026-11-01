@@ -15,10 +15,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from EncDec import (
     CHUNK_ENC_MAGIC,
     RELEASE_ENC_MAGIC,
+    clear_secret_caches,
     decrypt,
     decrypt_bytes,
     decrypt_chunk_payload,
+    decrypt_legacy,
     decrypt_local,
+    enc_json_path,
     encrypt,
     encrypt_bytes,
     encrypt_chunk_payload,
@@ -26,6 +29,8 @@ from EncDec import (
     encrypt_v2,
     generate_chunk_dek,
     is_encrypted_chunk,
+    load_enc_json,
+    save_enc_json,
     unwrap_chunk_dek,
     wrap_chunk_dek,
 )
@@ -77,6 +82,15 @@ def run_tests():
         decrypt_chunk_payload(dek, "icon-test", 42, chunk) == b"chunk-payload",
         "chunk round-trip failed",
     )
+
+    _expect(decrypt_legacy(wire_v3, mesh_secret=FAKE_MESH) == plain, "decrypt_legacy failed")
+    clear_secret_caches()
+    import tempfile
+    td = tempfile.mkdtemp()
+    jp = os.path.join(td, "sample.json")
+    _expect(save_enc_json(jp, {"a": 1}, mesh_secret=FAKE_MESH), "save_enc_json failed")
+    _expect(enc_json_path(jp).endswith(".enc"), "enc_json_path failed")
+    _expect(load_enc_json(jp, mesh_secret=FAKE_MESH) == {"a": 1}, "load_enc_json failed")
 
     print("EncDec public self-test: OK")
     return 0

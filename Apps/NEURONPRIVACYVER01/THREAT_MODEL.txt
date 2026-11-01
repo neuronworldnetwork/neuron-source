@@ -1,0 +1,33 @@
+Neuron Privacy Verifier — threat model (public)
+================================================
+
+Assets
+------
+- User confidence that Neuron is not exfiltrating personal data to the vendor
+  or unexplained third parties.
+- Peer anonymity and message confidentiality (must not be weakened by the verifier).
+- Official seal integrity of the verifier itself.
+
+Adversaries
+-----------
+1. Curious user / skeptic on their own machine (intended audience).
+2. Modified verifier binary that tries to look Official while logging endpoints.
+3. Closed Neuron binary that phones home (what the verifier aims to detect).
+4. External port scanners / random Internet hosts probing Neuron ports.
+
+Out of scope
+------------
+- Remote monitoring of someone else's Neuron.
+- Proving peer honesty or encryption correctness.
+- Hiding traffic from the local machine administrator.
+- Stopping all third-party contact (declared infra such as STUN / IP discovery
+  is expected and labeled).
+
+Controls
+--------
+- Separate process; no Support imports; no payload/DPI.
+- UI and public proof never emit IPs/ports/hosts.
+- Peer endpoints hashed with ephemeral session salt.
+- SHA256 seal over classifier, allowlist, and UI modules.
+- Inbound unauthorized counts reinforce that the node is watched.
+- Helpdesk forensics are opt-in via explicit Send anomaly report.

@@ -1,0 +1,14 @@
+Neuron Network Transparency Statement (verifier companion)
+==========================================================
+
+Neuron World Network states that the Privacy Verifier’s declared infrastructure
+list (infra_allowlist.json) enumerates non-peer destinations the product may
+contact for IP discovery, call setup assist, connectivity checks, optional
+weather/search/news helpers, and user-configured mail/share providers.
+
+Neuron does not operate a hidden telemetry / analytics phone-home endpoint as
+part of normal mesh operation. Any unexplained outbound destination should
+appear as REVIEW in the verifier and may be reported to neuron-helpdesk@proton.me.
+
+This statement is versioned with the verifier allowlist. Auditors should compare
+observed categories against infra_allowlist.json in this folder.

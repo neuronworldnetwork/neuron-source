@@ -1,0 +1,15 @@
+{
+  "app_id": "NEURONPRIVACYVER01",
+  "name": "Neuron Privacy Verifier",
+  "description": "Self-only monitor: assert Neuron traffic stays among peers, local services, or declared infrastructure — without exposing addresses, ports, or payloads.",
+  "developer": "Neuron World Network",
+  "version": "1.2.2",
+  "main": "main",
+  "tier": "first_party",
+  "category": "Security",
+  "license": "Open Source",
+  "icon": "PrivacyVerifier.png",
+  "provides": ["privacy_verifier"],
+  "store_optional": true,
+  "price_neurons": 0
+}

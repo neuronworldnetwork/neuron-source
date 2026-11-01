@@ -384,3 +384,85 @@ def decrypt_chunk_payload(dek: bytes, icon_id: str, chk_id: int, packet: bytes) 
     nonce = packet[len(CHUNK_ENC_MAGIC) + 4 : len(CHUNK_ENC_MAGIC) + 4 + 12]
     ciphertext = packet[len(CHUNK_ENC_MAGIC) + 4 + 12 :]
     return AESGCM(dek).decrypt(nonce, ciphertext, associated_data=_chunk_aad(icon_id, chk_id))
+
+
+def decrypt_legacy(data: str, **kwargs) -> str:
+    """Compatibility alias used by older call sites; same construction as decrypt()."""
+    return decrypt(data, **kwargs)
+
+
+def clear_secret_caches() -> None:
+    """
+    Production installs cache per-node secrets in memory.
+    The public export has no live secret cache — this is a no-op documented for API parity.
+    """
+    return None
+
+
+def enc_json_path(path: str) -> str:
+    """Map a logical JSON path to its encrypted sibling (*.enc)."""
+    p = (path or "").rstrip()
+    if not p:
+        return p
+    if p.lower().endswith(".enc"):
+        return p
+    if p.lower().endswith(".json"):
+        return p[:-5] + ".enc"
+    return p + ".enc"
+
+
+def enc_json_exists(path: str) -> bool:
+    if not path:
+        return False
+    return os.path.isfile(enc_json_path(path)) or os.path.isfile(path)
+
+
+def load_enc_json(path: str, *, mesh_secret: bytes = None) -> dict:
+    """
+    Read JSON that may be stored as ciphertext (encrypt()) or plaintext JSON.
+    Callers supply mesh_secret explicitly in this public export.
+    """
+    import json
+
+    if not path:
+        return {}
+    enc_path = enc_json_path(path)
+    try:
+        if os.path.isfile(enc_path):
+            with open(enc_path, "r", encoding="utf-8") as f:
+                raw = (f.read() or "").strip()
+            if not raw:
+                return {}
+            if raw[:1] in "{[":
+                data = json.loads(raw)
+            else:
+                data = json.loads(decrypt(raw, mesh_secret=mesh_secret))
+            return data if isinstance(data, (dict, list)) else {}
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, (dict, list)) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def save_enc_json(path: str, data, *, mesh_secret: bytes = None) -> bool:
+    """Write JSON via encrypt(); drops leftover plaintext .json when paths differ."""
+    import json
+
+    if not path:
+        return False
+    enc_path = enc_json_path(path)
+    payload = json.dumps(data if data is not None else {}, indent=2, ensure_ascii=True)
+    folder = os.path.dirname(enc_path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    with open(enc_path, "w", encoding="utf-8") as f:
+        f.write(encrypt(payload, mesh_secret=mesh_secret))
+    if os.path.isfile(path) and os.path.normcase(path) != os.path.normcase(enc_path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+    return True

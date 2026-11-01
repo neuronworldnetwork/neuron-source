@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "files": {
+    "redact_core.py": "e4804430a68d025c3c17239e97cd7f7c728c7ddcc6ac8a71d2684ff9c962e77e",
+    "collector.py": "9a45d3eba323d6f69a66953e150492262e88fce38852293462e82da0e615e185",
+    "peer_digests.py": "7c8e9f1a024a120b84244bbd2d0a330e0eba66a0d70531b8791d960a6e284311",
+    "infra_allowlist.json": "d82556a9b949ac8840f571f5831ca86443e551d9d696416d3176b70218b91df1",
+    "main.py": "d7737213cfa80d9b75869acea5fb81aa3e2b42368560fd88c038e22f9c08f2be",
+    "QueuesApp_NEURONPRIVACYVER01.py": "8f3fc7f051cf36c6216840741ea40d34cd96f5773a1b239cb0a7d4695376c37e",
+    "manifest.json": "f36073422627ab45bbe7091a413028401e679006f08279a34c7d1bfbb0e8fc7d",
+    "commands.json": "d8857384e85ef622c845cc585af21a309fa20ec7b5ccd5296b11ec6c64444391",
+    "report_route.json": "f67255cbe12197d5ef4f6071b2087c4ab955eac5ef835edd8e6fac66490b8eb6",
+    "report_send.py": "f5f7ccb6edb98fbfd70f63995759453c9301f348a797be50b33ccd7569f6aae1"
+  },
+  "note": "Official seal. If any listed file changes, the app marks the build untrusted."
+}

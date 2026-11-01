@@ -1,0 +1,11 @@
+{
+  "commands": [
+    {
+      "id": "NEURONPRIVACYVER0100000",
+      "name": "privacy_anomaly_report",
+      "feature": "app.custom",
+      "maps_to": null,
+      "description": "Redacted privacy-verifier anomaly report to helpdesk peer"
+    }
+  ]
+}

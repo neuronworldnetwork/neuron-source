@@ -1,0 +1,49 @@
+Neuron Privacy Verifier
+=======================
+
+Self-only open app under Apps/NEURONPRIVACYVER01.
+
+What it proves
+--------------
+Outbound destinations of Neuron processes are classified as:
+  peer | local | home network | declared infrastructure | user/crawl web | unexplained
+
+CLEAR means zero unexplained outbound destinations (and an Official seal).
+REVIEW means something still unexplained — not a claim that Neuron is spying.
+
+Access shield (separate):
+  Counts inbound contacts to Neuron service ports from peers / home / local
+  versus unauthorized outside sources. Identities are never shown.
+  Elevated probing is surfaced to reinforce that the node is watched.
+
+What it never shows
+-------------------
+IP addresses, ports, hostnames, peer names/ids, URLs, messages, files, or Neuron algorithms.
+
+Trust limits
+------------
+- Independent OS connection sampling for Neuron PIDs.
+- Peer membership digests come from your local Me/Peers IP columns (hashed in memory).
+- Declared infrastructure hosts are listed in infra_allowlist.json for auditors; the UI shows category labels only.
+- A closed Neuron that lied about peer membership could try to smuggle a spy host into Peers; that is visible in the normal Peers UI as an unexpected peer.
+- Open source can be audited; integrity.json seals the Official build. Modified builds cannot export Official proof.
+
+Isolation
+---------
+Runs as a separate process via AppBroker. Does not import Support. Does not hook SendData or UI timers.
+
+Anomaly reports
+---------------
+Send anomaly report uses mesh peer_handle from report_route.json (a node id, never an IP).
+On the helpdesk node, QueuesApp appends the report text to System/logs/USER_ERRORS.log.
+If P2P fails, a mailto draft to neuron-helpdesk@proton.me is opened (user must click Send).
+On-screen UI never shows endpoints. Helpdesk-only forensics may include source IP/port for investigation.
+Full text is also saved to data/last_helpdesk_report.txt.
+
+Launch without a console
+------------------------
+launch_silent.vbs or pythonw main.py
+(main.py also re-launches under pythonw when started from python.exe)
+
+Rebuild seal after intentional edits:
+  python seal_integrity.py
