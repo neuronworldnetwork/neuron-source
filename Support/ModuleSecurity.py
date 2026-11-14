@@ -21,6 +21,152 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 _DPAPI_PREFIX = b"NEURON_DPAPI_V1\n"
 
 
+def _module_extension_suffixes() -> List[str]:
+    """Python load order: tagged .cp312-win_amd64.pyd before plain .pyd."""
+    try:
+        import importlib.machinery as _im
+        suffixes = list(getattr(_im, 'EXTENSION_SUFFIXES', []) or [])
+    except Exception:
+        suffixes = []
+    for extra in ('.cp312-win_amd64.pyd', '.pyd'):
+        if extra not in suffixes:
+            suffixes.append(extra)
+    return suffixes
+
+
+def _frontend_vault_decrypts(pyd_path: str, vault_path: str) -> bool:
+    """True when this FrontendVault*.pyd can open System/frontend.vault."""
+    if not pyd_path or not vault_path:
+        return False
+    if not os.path.isfile(pyd_path) or not os.path.isfile(vault_path):
+        return False
+    import importlib.util
+    import sys as _sys
+    try:
+        spec = importlib.util.spec_from_file_location(
+            '_FrontendVaultProbe', os.path.abspath(pyd_path)
+        )
+        if spec is None or spec.loader is None:
+            return False
+        mod = importlib.util.module_from_spec(spec)
+        # Avoid clobbering a live FrontendVault import in this process.
+        spec.loader.exec_module(mod)
+        mod.initialize(os.path.abspath(vault_path))
+        return True
+    except Exception:
+        return False
+    finally:
+        _sys.modules.pop('_FrontendVaultProbe', None)
+
+
+def remove_stale_module_binaries(module_dir: str, name: str, keep_path: Optional[str] = None) -> None:
+    """Delete every importable binary for name so a new .pyd cannot lose to an old tagged .pyd.
+
+    FrontendVault special-case: before deleting a tagged sibling, if the kept
+    plain .pyd cannot decrypt System/frontend.vault but the tagged one can,
+    promote tagged -> keep. Manual dual-copies often refresh only the tagged
+    file; startup used to delete it and leave a stale plain .pyd.
+    """
+    keep_norm = os.path.normcase(os.path.abspath(keep_path)) if keep_path else None
+    keep_abs = os.path.abspath(keep_path) if keep_path else None
+
+    if name == 'FrontendVault' and keep_abs:
+        vault_path = os.path.abspath(
+            os.path.join(module_dir, os.pardir, 'System', 'frontend.vault')
+        )
+        if not os.path.isfile(vault_path):
+            vault_path = os.path.abspath(
+                os.path.join(os.path.dirname(module_dir), 'System', 'frontend.vault')
+            )
+        keep_ok = _frontend_vault_decrypts(keep_abs, vault_path) if os.path.isfile(keep_abs) else False
+        if not keep_ok:
+            for suf in _module_extension_suffixes():
+                if suf == '.pyd':
+                    continue
+                tagged = os.path.join(module_dir, name + suf)
+                if not os.path.isfile(tagged):
+                    continue
+                if os.path.normcase(os.path.abspath(tagged)) == keep_norm:
+                    continue
+                if _frontend_vault_decrypts(tagged, vault_path):
+                    try:
+                        shutil.copy2(tagged, keep_abs)
+                        print(
+                            "[MODULE_SECURITY] FrontendVault: promoted tagged pyd "
+                            "over plain (plain could not decrypt frontend.vault)"
+                        )
+                    except Exception as e:
+                        print(f"[MODULE_SECURITY] FrontendVault promote failed: {e}")
+                    break
+
+    for suf in _module_extension_suffixes():
+        path = os.path.join(module_dir, name + suf)
+        if not os.path.exists(path):
+            continue
+        if keep_norm and os.path.normcase(os.path.abspath(path)) == keep_norm:
+            continue
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
+def read_binary_even_if_locked(path: str) -> bytes:
+    """
+    Read file bytes even when Neuron has the .pyd loaded.
+    Tries normal open, then Win32 share-mode read, then copy-to-temp.
+    """
+    try:
+        with open(path, 'rb') as f:
+            return f.read()
+    except OSError:
+        pass
+
+    if os.name == 'nt':
+        try:
+            import ctypes
+            from ctypes import wintypes
+            GENERIC_READ = 0x80000000
+            FILE_SHARE_ALL = 0x00000007
+            OPEN_EXISTING = 3
+            FILE_ATTRIBUTE_NORMAL = 0x80
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.CreateFileW(
+                str(path), GENERIC_READ, FILE_SHARE_ALL, None,
+                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None
+            )
+            if handle not in (-1, 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF):
+                try:
+                    size = os.path.getsize(path)
+                    buf = ctypes.create_string_buffer(size)
+                    read = wintypes.DWORD(0)
+                    if kernel32.ReadFile(handle, buf, size, ctypes.byref(read), None):
+                        return buf.raw[:read.value]
+                finally:
+                    kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix='neuron_deploy_', suffix='.pyd')
+        os.close(fd)
+        shutil.copyfile(path, tmp)
+        with open(tmp, 'rb') as f:
+            return f.read()
+    except Exception as e:
+        raise Exception(f"Cannot read {path} (file may be locked): {e}")
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+
+
+
+
 def _dpapi_available() -> bool:
     try:
         import Support.Header as init
@@ -680,6 +826,7 @@ def _node_local_crypto_paths() -> list:
         getattr(init, "PATH_CHUNK_STREAM_SECRET", ""),
         getattr(init, "PATH_WEBRTC_ROOM_SECRET", ""),
         getattr(init, "PATH_PROJECTOR_SECRET", ""),
+        getattr(init, "PATH_CALENDAR_ADMIN_SECRET", ""),
         getattr(init, "PATH_TLS_PINS", ""),
         getattr(init, "PATH_PEER_CRYPTO_OWNER", ""),
     ]
@@ -1111,7 +1258,32 @@ def _peer_id_known(peer_id: str) -> bool:
             if row_peer_id == peer_key:
                 return True
     except Exception:
-        return False
+        pass
+    # PEERS memory can lag DB (or be empty in side scripts). Park/poll mailbox
+    # resolve must still treat known DB peers as first-class ids.
+    try:
+        import Support.Header as init
+        from Support.Utils import query_database
+        pool = getattr(init, 'pool_main_db', None)
+        if pool is not None:
+            rows = query_database(
+                pool,
+                "SELECT 1 FROM Peers WHERE peer_id = ? LIMIT 1",
+                (peer_key,),
+                commit=False,
+            )
+            if rows:
+                return True
+            rows = query_database(
+                pool,
+                "SELECT 1 FROM Me WHERE id = ? LIMIT 1",
+                (peer_key,),
+                commit=False,
+            )
+            if rows:
+                return True
+    except Exception:
+        pass
     return False
 
 
@@ -1662,8 +1834,285 @@ def peer_command_allows_unsigned(command) -> bool:
 def peer_command_requires_signature(command) -> bool:
     try:
         import Support.Header as init
-        required = getattr(init, 'PEER_MONEY_COMMANDS', None) or ()
-        return str(command or '') in required
+        cmd = str(command or '')
+        money = getattr(init, 'PEER_MONEY_COMMANDS', None) or ()
+        hard = getattr(init, 'PEER_HARD_SIGNED_COMMANDS', None) or ()
+        return cmd in money or cmd in hard
+    except Exception:
+        return False
+
+
+def request_from_local_node(remote_addr: str = '', me=None) -> bool:
+    """True for loopback or this node's Me.ip / Me.ip_local (LAN self-calls)."""
+    addr = (remote_addr or '').strip()
+    if not addr:
+        return False
+    if addr in ('127.0.0.1', '::1', 'localhost'):
+        return True
+    if addr.startswith(':ffff:'):
+        addr = addr[7:]
+    try:
+        import Support.Header as init
+        if me is None:
+            me = getattr(init, 'ME', None) or {}
+        if isinstance(me, dict):
+            for key in ('ip', 'ip_local'):
+                val = me.get(key)
+                if val and str(val).strip() == addr:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def ip_is_private_or_local(remote_addr: str = '') -> bool:
+    """True for loopback, link-local, or RFC1918 private addresses."""
+    addr = (remote_addr or '').strip().lower()
+    if not addr:
+        return False
+    if addr in ('127.0.0.1', '::1', 'localhost'):
+        return True
+    if addr.startswith(':ffff:'):
+        addr = addr[7:]
+    try:
+        import ipaddress
+        ip = ipaddress.ip_address(addr)
+        return bool(ip.is_private or ip.is_loopback or ip.is_link_local)
+    except Exception:
+        return False
+
+
+def device_cookie_is_approved(device_id: str = '') -> bool:
+    """True when Devices.pending == 0 for this device_id (no cache; safe from any process)."""
+    device_id = str(device_id or '').strip()
+    if not device_id:
+        return False
+    try:
+        import Support.Header as init
+        from Support.Utils import query_database
+        rows = query_database(
+            init.pool_main_db,
+            'SELECT pending FROM Devices WHERE device_id = ?',
+            (device_id,),
+        )
+        if not rows:
+            return False
+        return int(rows[0][0]) == 0
+    except Exception:
+        return False
+
+
+def calendar_admin_token() -> str:
+    """Per-install random admin token for calendar/doctor mutations (not derived from Me.id)."""
+    try:
+        import Support.Header as init
+        path = getattr(init, 'PATH_CALENDAR_ADMIN_SECRET', '') or ''
+        if not path:
+            return ensure_secret_file(
+                getattr(init, 'PATH_JSON', '') + 'calendar_admin.secret', 32
+            )[:32]
+        return ensure_secret_file(path, 32)[:32]
+    except Exception:
+        return os.urandom(16).hex()
+
+
+def is_calendar_admin_request(headers=None, client_addr: str = '', device_id: str = '') -> bool:
+    """
+    Allow calendar/doctor mutations when:
+    - X-Neuron-Calendar-Admin matches per-install secret, or
+    - direct loopback / this node's own IP (no X-Forwarded-For), or
+    - Apache/local reverse proxy (loopback client) and original XFF client is
+      this node or a private/LAN address (clinic PC/phone on LAN), or
+    - approved device cookie.
+    """
+    headers = headers or {}
+    try:
+        get = headers.get if hasattr(headers, 'get') else (lambda k, d='': d)
+        token = (get('X-Neuron-Calendar-Admin') or get('x-neuron-calendar-admin') or '').strip()
+        if token and token == calendar_admin_token():
+            return True
+        xff = (get('X-Forwarded-For') or get('X-Real-IP') or get('x-forwarded-for') or get('x-real-ip') or '').strip()
+        me = None
+        try:
+            import Support.Header as init
+            me = getattr(init, 'ME', None) or {}
+            if not (isinstance(me, dict) and (me.get('ip') or me.get('ip_local'))):
+                from Support.Dictionaries import load_dictionaries
+                from Support.Header import DICTIONARY_ME
+                load_dictionaries(DICTIONARY_ME)
+                me = getattr(init, 'ME', None) or {}
+        except Exception:
+            me = None
+        if request_from_local_node(client_addr, me=me):
+            if not xff:
+                return True
+            # ProxyPass sets X-Forwarded-For. Allow this node and LAN clients;
+            # public WAN XFF still requires token or approved device.
+            xff_client = xff.split(',')[0].strip()
+            if request_from_local_node(xff_client, me=me):
+                return True
+            if ip_is_private_or_local(xff_client):
+                return True
+        if device_cookie_is_approved(device_id):
+            return True
+    except Exception:
+        return False
+    return False
+
+
+_ingress_rate_lock = threading.Lock()
+_ingress_rate_buckets = {}
+
+
+def ingress_rate_allow(bucket_key: str, limit_per_minute: int) -> bool:
+    """True if under limit for this key in the current UTC minute. limit<=0 disables."""
+    try:
+        limit = int(limit_per_minute or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    if limit <= 0:
+        return True
+    key = str(bucket_key or '').strip() or 'anon'
+    window = int(time.time() // 60)
+    with _ingress_rate_lock:
+        if len(_ingress_rate_buckets) > 20000:
+            stale = [k for k, (w, _) in _ingress_rate_buckets.items() if w < window - 2]
+            for k in stale[:5000]:
+                del _ingress_rate_buckets[k]
+        entry = _ingress_rate_buckets.get(key)
+        if not entry or entry[0] != window:
+            _ingress_rate_buckets[key] = (window, 1)
+            return True
+        count = int(entry[1]) + 1
+        _ingress_rate_buckets[key] = (window, count)
+        return count <= limit
+
+
+def accept_legacy_mesh_decrypt() -> bool:
+    """
+    Existing installs keep MASTER_SECRET decrypt (flag '1').
+    Brand-new installs (no prior crypto artifacts) get flag '0'.
+    Header.MESH_ACCEPT_LEGACY_DECRYPT=False always wins (hard off).
+    """
+    try:
+        import Support.Header as init
+        if not bool(getattr(init, 'MESH_ACCEPT_LEGACY_DECRYPT', True)):
+            return False
+        flag_path = getattr(init, 'PATH_MESH_LEGACY_DECRYPT_FLAG', '') or ''
+        if not flag_path:
+            return True
+        if os.path.isfile(flag_path):
+            try:
+                with open(flag_path, 'r', encoding='utf-8') as handle:
+                    return handle.read().strip() != '0'
+            except Exception:
+                return True
+        prior = False
+        for attr in (
+            'PATH_MESH_SECRET', 'PATH_ENCDEC_LOCAL_SECRET', 'PATH_PEER_PUBKEYS',
+            'PATH_PEER_PRIVKEY', 'PATH_PEER_PUBKEY',
+        ):
+            p = getattr(init, attr, '') or ''
+            if p and os.path.isfile(p):
+                prior = True
+                break
+        value = '1' if prior else '0'
+        try:
+            os.makedirs(os.path.dirname(flag_path), exist_ok=True)
+            with open(flag_path, 'w', encoding='utf-8') as handle:
+                handle.write(value)
+        except Exception:
+            pass
+        return value != '0'
+    except Exception:
+        return True
+
+
+def make_hive_api_auth_headers(method: str, path: str, body: bytes = b'') -> Dict[str, str]:
+    """Ed25519 headers for HiveService HTTP calls (optional; older peers omit)."""
+    try:
+        private_key = _load_peer_private_key()
+        if not private_key:
+            return {}
+        import Support.Header as init
+        me = getattr(init, 'ME', None) or {}
+        peer_id = str(
+            (me.get('id') if isinstance(me, dict) else '')
+            or (me.get('peer_id') if isinstance(me, dict) else '')
+            or ''
+        ).strip()
+        if not peer_id:
+            return {}
+        ts = str(int(time.time()))
+        nonce = os.urandom(8).hex()
+        body_hash = hashlib.sha256(body or b'').hexdigest()
+        msg = ('|'.join([
+            str(method or 'GET').upper(),
+            str(path or ''),
+            ts,
+            nonce,
+            body_hash,
+        ])).encode('utf-8')
+        sig = private_key.sign(msg).hex()
+        return {
+            'X-Neuron-Hive-Peer': peer_id,
+            'X-Neuron-Hive-Ts': ts,
+            'X-Neuron-Hive-Nonce': nonce,
+            'X-Neuron-Hive-Sig': sig,
+        }
+    except Exception:
+        return {}
+
+
+def verify_hive_api_auth(headers, method: str, path: str, body: bytes = b'', max_skew: int = 600) -> bool:
+    """Verify optional Hive API Ed25519 headers. False if missing/invalid."""
+    try:
+        get = headers.get if hasattr(headers, 'get') else (lambda k, d=None: d)
+        peer_id = str(get('X-Neuron-Hive-Peer') or get('x-neuron-hive-peer') or '').strip()
+        ts = get('X-Neuron-Hive-Ts') or get('x-neuron-hive-ts')
+        nonce = str(get('X-Neuron-Hive-Nonce') or get('x-neuron-hive-nonce') or '').strip()
+        sig_hex = str(get('X-Neuron-Hive-Sig') or get('x-neuron-hive-sig') or '').strip()
+        if not peer_id or ts is None or not nonce or not sig_hex:
+            return False
+        try:
+            ts_int = int(ts)
+        except (TypeError, ValueError):
+            return False
+        if abs(int(time.time()) - ts_int) > int(max_skew):
+            return False
+        stored = _load_peer_pubkeys().get(peer_id)
+        if not stored or len(stored) != 64:
+            return False
+        body_hash = hashlib.sha256(body or b'').hexdigest()
+        msg = ('|'.join([
+            str(method or 'GET').upper(),
+            str(path or ''),
+            str(ts_int),
+            nonce,
+            body_hash,
+        ])).encode('utf-8')
+        try:
+            signature = bytes.fromhex(sig_hex)
+        except Exception:
+            return False
+        if not _verify_peer_signature(stored, signature, msg):
+            return False
+        with _peer_nonce_lock:
+            now = time.time()
+            nonce_key = f"hive:{peer_id}:{nonce}"
+            if nonce_key in _peer_seen_nonces:
+                return False
+            _peer_seen_nonces[nonce_key] = now + float(max_skew)
+        return True
+    except Exception:
+        return False
+
+def hive_api_auth_present(headers) -> bool:
+    try:
+        get = headers.get if hasattr(headers, 'get') else (lambda k, d=None: d)
+        return bool(
+            (get('X-Neuron-Hive-Sig') or get('x-neuron-hive-sig') or '').strip()
+        )
     except Exception:
         return False
 
@@ -1683,7 +2132,18 @@ def peer_packet_header_expired(header, max_skew_seconds: int = None) -> bool:
             peer_ts_int = int(float(peer_ts))
         except (TypeError, ValueError):
             return False
-        return abs(int(time.time()) - peer_ts_int) > int(max_skew_seconds)
+        delta = abs(int(time.time()) - peer_ts_int)
+        expired = delta > int(max_skew_seconds)
+        if expired:
+            try:
+                cmd = header.get('command', '?')
+                print(
+                    f"[PEER_TS] drop expired cmd={cmd} lim={max_skew_seconds}s "
+                    f"delta={delta}s peer_ts={peer_ts_int}"
+                )
+            except Exception:
+                pass
+        return expired
     except Exception:
         return False
 
@@ -1906,8 +2366,14 @@ def verify_peer_packet(queue_item, max_skew_seconds: int = None) -> bool:
             if nonce_key in _peer_seen_nonces:
                 return False if money_cmd else soft_ok
             _peer_seen_nonces[nonce_key] = now + float(max_skew_seconds)
-            if len(_peer_seen_nonces) > 8000:
-                for k in list(_peer_seen_nonces.keys())[:2000]:
+            try:
+                import Support.Header as _init_nc
+                cache_max = int(getattr(_init_nc, 'PEER_SIG_NONCE_CACHE_MAX', 65536))
+                evict_n = int(getattr(_init_nc, 'PEER_SIG_NONCE_EVICT', 8192))
+            except Exception:
+                cache_max, evict_n = 65536, 8192
+            if len(_peer_seen_nonces) > cache_max:
+                for k in list(_peer_seen_nonces.keys())[:max(1, evict_n)]:
                     del _peer_seen_nonces[k]
         if src_peer_id and (not stored or stored != pubkey_hex):
             _apply_verified_peer_pubkey(
@@ -1942,16 +2408,51 @@ def verify_peer_packet(queue_item, max_skew_seconds: int = None) -> bool:
             return False
 
 
-def ensure_secret_file(path: str, nbytes: int = 32) -> str:
-    """Load or create a per-install secret as hex text. Cached callers should store the return."""
+def _write_secret_file_bytes(path: str, payload: bytes) -> None:
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    with open(path, "wb") as handle:
+        handle.write(payload)
+
+
+def ensure_secret_file(path: str, nbytes: int = 32, dpapi: bool = False) -> str:
+    """Load or create a per-install secret as hex text. Cached callers should store the return.
+
+    When dpapi=True on Windows, the file is stored as DPAPI-wrapped bytes (NEURON_DPAPI_V1)
+    so a raw file copy off-box cannot recover the secret. Plaintext hex files are migrated
+    in place on first successful protect.
+    """
     try:
         if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as handle:
-                value = handle.read().strip()
+            with open(path, "rb") as handle:
+                raw = handle.read()
+            value = ''
+            if dpapi and raw.startswith(_DPAPI_PREFIX):
+                try:
+                    plain = dpapi_unprotect(raw[len(_DPAPI_PREFIX):])
+                    value = plain.decode('utf-8').strip()
+                except Exception:
+                    value = ''
+            else:
+                try:
+                    value = raw.decode('utf-8').strip()
+                except Exception:
+                    value = ''
             if value:
+                if dpapi and _dpapi_available() and not raw.startswith(_DPAPI_PREFIX):
+                    try:
+                        protected = dpapi_protect(value.encode('utf-8'))
+                        if protected and protected != value.encode('utf-8'):
+                            _write_secret_file_bytes(path, _DPAPI_PREFIX + protected)
+                    except Exception:
+                        pass
                 return value
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
         value = os.urandom(nbytes).hex()
+        if dpapi and _dpapi_available():
+            protected = dpapi_protect(value.encode('utf-8'))
+            if protected and protected != value.encode('utf-8'):
+                _write_secret_file_bytes(path, _DPAPI_PREFIX + protected)
+                return value
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(value)
         return value
@@ -2286,11 +2787,33 @@ def _load_release_zip_bytes(sidecar: Dict[str, Any]) -> Optional[bytes]:
     return None
 
 
-def merge_cumulative_release(release: Dict[str, Any]) -> Dict[str, Any]:
+def _sidecar_on_major(sc: Dict[str, Any], target_major: int) -> bool:
+    sc_ver = sc.get('version') or ''
+    return int(_release_version_tuple(sc_ver)[0]) == int(target_major)
+
+
+def _sidecar_on_patch_train(sc: Dict[str, Any], target_major: int, target_minor: int) -> bool:
+    """Prior patch (or untyped) on the same M.m train — not minor/major baselines."""
+    sc_ver = sc.get('version') or ''
+    t = _release_version_tuple(sc_ver)
+    if int(t[0]) != int(target_major) or int(t[1]) != int(target_minor):
+        return False
+    kind = str(sc.get('kind') or '').lower()
+    if kind in ('minor', 'major'):
+        return False
+    return True
+
+
+def _merge_priors_into_release(
+    release: Dict[str, Any],
+    prior_predicate,
+    *,
+    kind: str,
+    covers_from: str,
+) -> Dict[str, Any]:
     """
-    Add the latest previously shipped PYD of every module not in this wizard
-    selection, and prior SQL/file/script actions tagged with original_release_id.
-    Each original_release_id is included once (oldest package first).
+    Fold modules/actions from prior local releases selected by prior_predicate.
+    Current selection wins on module name; prior actions keep original_release_id.
     """
     import io
     import zipfile
@@ -2299,6 +2822,7 @@ def merge_cumulative_release(release: Dict[str, Any]) -> Dict[str, Any]:
     current_modules = list(release.get('modules') or [])
     current_names = {m.get('name') for m in current_modules if m.get('name')}
     current_actions = list(release.get('actions') or [])
+    target_major = int(_release_version_tuple(release.get('version', '0.0.0'))[0])
 
     best_modules = {}
     inherited_actions = []
@@ -2310,6 +2834,13 @@ def merge_cumulative_release(release: Dict[str, Any]) -> Dict[str, Any]:
     for sc in previous:
         rid = sc.get('release_id', '')
         if not rid or rid == current_id:
+            continue
+        if not prior_predicate(sc):
+            continue
+        # Never pull a package newer than the one we are building.
+        if _release_version_tuple(sc.get('version') or '0') >= _release_version_tuple(
+            release.get('version', '0.0.0')
+        ):
             continue
         zip_bytes = _load_release_zip_bytes(sc)
         if not zip_bytes:
@@ -2377,7 +2908,586 @@ def merge_cumulative_release(release: Dict[str, Any]) -> Dict[str, Any]:
 
     release['modules'] = current_modules + list(best_modules.values())
     release['actions'] = inherited_actions + tagged_current
+    release['kind'] = kind
+    release['cumulative'] = True
+    release['major'] = target_major
+    release['covers_from'] = covers_from
     return release
+
+
+def _verify_priors_complete(release: Dict[str, Any], prior_predicate) -> Tuple[bool, str]:
+    """Fail if any selected prior is unreadable or missing modules/action origins."""
+    import io
+    import zipfile
+
+    current_id = release.get('release_id', '')
+    module_best = {}
+    for mod in release.get('modules') or []:
+        name = mod.get('name')
+        if not name:
+            continue
+        ver = str(mod.get('version', '0.0.0'))
+        prev = module_best.get(name)
+        if prev is None or _release_version_tuple(ver) >= _release_version_tuple(prev):
+            module_best[name] = ver
+
+    origin_ids = set()
+    for action in release.get('actions') or []:
+        origin = action.get('original_release_id') or current_id
+        if origin:
+            origin_ids.add(origin)
+    if current_id:
+        origin_ids.add(current_id)
+
+    missing_modules = []
+    missing_origins = []
+    for sc in list_local_releases():
+        rid = sc.get('release_id', '')
+        if not rid or rid == current_id:
+            continue
+        if not prior_predicate(sc):
+            continue
+        if _release_version_tuple(sc.get('version') or '0') >= _release_version_tuple(
+            release.get('version', '0.0.0')
+        ):
+            continue
+        zip_bytes = _load_release_zip_bytes(sc)
+        if not zip_bytes:
+            return False, f"Cannot read prior release {rid} for cumulative verify"
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(zip_bytes), 'r')
+        except Exception as e:
+            return False, f"Cannot open prior release {rid}: {e}"
+        try:
+            if 'manifest.json' not in zf.namelist():
+                continue
+            manifest = json.loads(zf.read('manifest.json').decode('utf-8'))
+            for mod in manifest.get('modules') or []:
+                name = mod.get('name')
+                if not name:
+                    continue
+                need = str(mod.get('version', '0.0.0'))
+                have = module_best.get(name)
+                if have is None or _release_version_tuple(have) < _release_version_tuple(need):
+                    missing_modules.append(f"{name}>={need} (from {rid})")
+            for action in manifest.get('actions') or []:
+                origin = action.get('original_release_id') or rid
+                if origin and origin not in origin_ids:
+                    missing_origins.append(origin)
+        finally:
+            zf.close()
+
+    if missing_modules or missing_origins:
+        parts = []
+        if missing_modules:
+            parts.append("missing/outdated modules: " + ", ".join(missing_modules[:12]))
+        if missing_origins:
+            parts.append("missing action origins: " + ", ".join(sorted(set(missing_origins))[:12]))
+        return False, "; ".join(parts)
+    return True, "cumulative package complete"
+
+
+def merge_cumulative_release(release: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Add the latest previously shipped PYD of every module not in this wizard
+    selection, and prior SQL/file/script actions tagged with original_release_id.
+    Each original_release_id is included once (oldest package first).
+    Only merges releases that share the same major as the package being built.
+    """
+    target_major = int(_release_version_tuple(release.get('version', '0.0.0'))[0])
+    return _merge_priors_into_release(
+        release,
+        lambda sc: _sidecar_on_major(sc, target_major),
+        kind=release.get('kind') or 'minor',
+        covers_from=f"{target_major}.0.0",
+    )
+
+
+def verify_cumulative_complete(release: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Fail the build if any same-major prior release has a module or action
+    origin that is missing from the merged package.
+    """
+    target_major = int(_release_version_tuple(release.get('version', '0.0.0'))[0])
+    return _verify_priors_complete(
+        release, lambda sc: _sidecar_on_major(sc, target_major)
+    )
+
+
+def merge_patch_train_release(release: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Patch-train merge: fold prior patches on the same M.m line so peers can
+    skip intermediates (e.g. 1.0.0 -> 1.0.2 still gets B/C from 1.0.1).
+    Resets at each new minor (covers_from = M.m.0).
+    """
+    maj, minr, _pat = _release_version_tuple(release.get('version', '0.0.0'))
+    return _merge_priors_into_release(
+        release,
+        lambda sc: _sidecar_on_patch_train(sc, int(maj), int(minr)),
+        kind='patch',
+        covers_from=f"{int(maj)}.{int(minr)}.0",
+    )
+
+
+def verify_patch_train_complete(release: Dict[str, Any]) -> Tuple[bool, str]:
+    """Fail build if any prior patch on this M.m train is missing from the merge."""
+    maj, minr, _pat = _release_version_tuple(release.get('version', '0.0.0'))
+    return _verify_priors_complete(
+        release, lambda sc: _sidecar_on_patch_train(sc, int(maj), int(minr))
+    )
+
+
+def effective_covers_from(entry: Dict[str, Any]) -> str:
+    """Floor version this package is safe to apply from (inclusive)."""
+    ver = entry.get('version') or '0.0.0'
+    vt = _release_version_tuple(ver)
+    kind = str(entry.get('kind') or '').lower()
+    cumulative = bool(entry.get('cumulative', kind == 'minor'))
+    covers = str(entry.get('covers_from') or '').strip()
+    if not covers:
+        if kind == 'major':
+            return '0.0.0'
+        if cumulative or kind == 'minor':
+            return f"{int(vt[0])}.0.0"
+        if kind == 'patch' and cumulative:
+            return f"{int(vt[0])}.{int(vt[1])}.0"
+        return ver
+    ct = _release_version_tuple(covers)
+    # Legacy non-cumulative patches used covers_from == own version (delta only).
+    # Cumulative patch-train packages use M.m.0 (or explicit floor).
+    if kind == 'patch' and ct == vt and cumulative:
+        return f"{int(vt[0])}.{int(vt[1])}.0"
+    return covers
+
+
+def release_applicable_to_installed(entry: Dict[str, Any], installed: str = '') -> bool:
+    """True if catalog/manifest entry is newer and safe to apply given installed train."""
+    if not entry:
+        return False
+    inst = installed or get_installed_release_version()
+    inst_t = _release_version_tuple(inst)
+    ver = entry.get('version') or '0.0.0'
+    vt = _release_version_tuple(ver)
+    if vt <= inst_t:
+        return False
+    kind = str(entry.get('kind') or '').lower()
+    if kind == 'major':
+        return True
+    if int(vt[0]) != int(inst_t[0]):
+        return False
+    cumulative = bool(entry.get('cumulative', kind == 'minor'))
+    floor = effective_covers_from(entry)
+    floor_t = _release_version_tuple(floor)
+    # Non-cumulative delta: only safe when there is no skip (floor <= installed).
+    # Legacy covers_from==version makes floor==version, so never applicable when behind.
+    if not cumulative and floor_t == vt:
+        return False
+    return floor_t <= inst_t
+
+
+def select_best_catalog_entry(
+    entries: List[Dict[str, Any]],
+    installed: str = '',
+) -> Optional[Dict[str, Any]]:
+    """
+    Newest applicable catalog entry.
+    Prefer same-major patch/minor (.nrel) over a major jump so peers finish the
+    current train before piece-swarm majors.
+    """
+    inst = installed or get_installed_release_version()
+    inst_t = _release_version_tuple(inst)
+    same_major = []
+    major_jumps = []
+    for entry in entries or []:
+        if not release_applicable_to_installed(entry, inst):
+            continue
+        rid = entry.get('release_id') or ''
+        if rid:
+            sc = load_release_sidecar(rid)
+            if sc and (sc.get('staged') or sc.get('installed')):
+                continue
+            # Major already downloaded locally: still eligible to apply, not re-pull.
+            if sc and sc.get('downloaded') and str(entry.get('kind') or '').lower() != 'major':
+                continue
+        kind = str(entry.get('kind') or '').lower()
+        vt = _release_version_tuple(entry.get('version') or '0.0.0')
+        if kind == 'major' and int(vt[0]) > int(inst_t[0]):
+            major_jumps.append(entry)
+        else:
+            same_major.append(entry)
+
+    def _newest(pool):
+        best = None
+        for entry in pool or []:
+            ver = entry.get('version') or '0.0.0'
+            if best is None or _release_version_tuple(ver) > _release_version_tuple(
+                best.get('version', '0')
+            ):
+                best = entry
+        return best
+
+    return _newest(same_major) or _newest(major_jumps)
+
+
+def build_adv_payload(version: str, release_id: str = '') -> List[str]:
+    """ADV data1: version, release_id, major, kind, covers_from, cumulative(0/1)."""
+    sc = load_release_sidecar(release_id) if release_id else {}
+    ver = str(version or sc.get('version') or '')
+    kind = str(sc.get('kind') or '')
+    entry = {
+        'version': ver,
+        'kind': kind,
+        'cumulative': sc.get('cumulative', kind == 'minor'),
+        'covers_from': sc.get('covers_from') or '',
+    }
+    return [
+        ver,
+        str(release_id or sc.get('release_id') or ''),
+        str(int(_release_version_tuple(ver)[0])) if ver else '0',
+        kind,
+        effective_covers_from(entry),
+        '1' if bool(entry.get('cumulative')) else '0',
+    ]
+
+
+def get_release_train_baseline() -> str:
+    """Highest of SystemInfo and any local release sidecar version."""
+    best = get_installed_release_version()
+    for sc in list_local_releases():
+        if sc.get('store_skip') or sc.get('store_skip_reason') == 'train_reset_superseded':
+            continue
+        ver = sc.get('version') or '0.0.0'
+        if _release_version_tuple(ver) > _release_version_tuple(best):
+            best = ver
+    return best
+
+
+def next_version_for_kind(kind: str) -> str:
+    """Automatic bump: major -> M+1.0.0, minor -> M.m+1.0, patch -> M.m.p+1."""
+    maj, minr, pat = _release_version_tuple(get_release_train_baseline())
+    kind = (kind or 'patch').strip().lower()
+    if kind == 'major':
+        return f"{int(maj) + 1}.0.0"
+    if kind == 'minor':
+        return f"{int(maj)}.{int(minr) + 1}.0"
+    return f"{int(maj)}.{int(minr)}.{int(pat) + 1}"
+
+
+def write_neuron_rar_version_sidecar(
+    rar_path: str,
+    version_str: str,
+    file_hash: str = '',
+    train_reset: bool = False,
+    post_apply_version: str = '',
+) -> str:
+    """Write Neuron.rar.version.json + register major in System/Releases for OTA swarm."""
+    import hashlib
+    from Support.Utils import generate_random_hash
+    from Support.Header import PATH_DISTRIBUTABLE_RELEASES
+    from Support.MajorUpgrade import (
+        build_major_sidecar_fields, default_major_ops, filter_ops_for_safety
+    )
+
+    sidecar_path = rar_path + '.version.json'
+    piece_size = 1024 * 1024
+    piece_hashes = []
+    size = 0
+    if os.path.isfile(rar_path):
+        h = hashlib.sha256()
+        with open(rar_path, 'rb') as f:
+            while True:
+                block = f.read(piece_size)
+                if not block:
+                    break
+                h.update(block)
+                piece_hashes.append(hashlib.sha256(block).hexdigest())
+                size += len(block)
+        if not file_hash:
+            file_hash = h.hexdigest()
+    maj, minr, pat = _release_version_tuple(version_str)
+    ver = f"{int(maj)}.{int(minr)}.{int(pat)}"
+    ops = filter_ops_for_safety(default_major_ops())
+    payload = {
+        'version': ver,
+        'major': int(maj),
+        'minor': int(minr),
+        'patch': int(pat),
+        'file_hash': (file_hash or '').lower(),
+        'rar_name': os.path.basename(rar_path),
+        'piece_size': piece_size,
+        'piece_hashes': piece_hashes,
+        'size': size,
+        'ops': ops,
+        'kind': 'major',
+        'transport': 'piece_swarm',
+    }
+    if train_reset:
+        payload['train_reset'] = True
+        payload['post_apply_version'] = str(post_apply_version or ver)
+    with open(sidecar_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2)
+
+    # Catalog entry so peers discover majors via CMD_APP_CAT (bytes via piece swarm).
+    try:
+        release_id = generate_random_hash()
+        fields = build_major_sidecar_fields(
+            rar_path, ver, release_id, ops=ops, piece_size=piece_size
+        )
+        fields['notes'] = 'major Neuron.rar'
+        fields['channel'] = 'prod'
+        fields['created_utc'] = payload.get('version') and ver
+        if train_reset:
+            fields['train_reset'] = True
+            fields['post_apply_version'] = str(post_apply_version or ver)
+        os.makedirs(PATH_DISTRIBUTABLE_RELEASES, exist_ok=True)
+        save_release_sidecar(release_id, fields)
+        payload['release_id'] = release_id
+        with open(sidecar_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2)
+        try:
+            advertise_release_to_peers(ver, release_id)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[RELEASE] major catalog register warn: {e}")
+    return sidecar_path
+
+
+def build_and_store_patch_release(modules: List[Dict[str, Any]],
+                                  notes: str = '',
+                                  channel: str = 'prod',
+                                  actions: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """
+    Build a patch-kind .nrel from module dicts
+    ({name, sub_folder, version, src_path or src_bytes}).
+    Optional actions (Send Files, SQL, removals, ...) travel with the package.
+    Merges prior patches on the same M.m train so peers can skip intermediates.
+    """
+    from Support.Header import (
+        PATH_RELEASE_PRIVKEY, PATH_RELEASE_PUBKEY, PATH_DISTRIBUTABLE_RELEASES, ME
+    )
+    from Support.Utils import generate_random_hash
+    from datetime import datetime, timezone
+
+    if not modules:
+        raise ValueError("No modules for patch release")
+    version = next_version_for_kind('patch')
+    release_id = generate_random_hash()
+    admin_ip = ''
+    if isinstance(ME, dict):
+        admin_ip = ME.get('ip', '') or ''
+    maj, minr, _pat = _release_version_tuple(version)
+    release = {
+        'release_id': release_id,
+        'version': version,
+        'notes': notes or 'Patch release',
+        'requires_restart': True,
+        'admin_ip': admin_ip,
+        'created_utc': datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        'modules': modules,
+        'actions': list(actions or []),
+        'channel': channel or 'prod',
+        'kind': 'patch',
+        'cumulative': True,
+        'major': int(maj),
+        'covers_from': f"{int(maj)}.{int(minr)}.0",
+    }
+    release = merge_patch_train_release(release)
+    ok, verify_msg = verify_patch_train_complete(release)
+    if not ok:
+        raise ValueError(f"Patch-train incomplete: {verify_msg}")
+    ensure_release_keypair(PATH_RELEASE_PRIVKEY, PATH_RELEASE_PUBKEY)
+    result = build_release_package(
+        release, PATH_RELEASE_PRIVKEY, PATH_RELEASE_PUBKEY, PATH_DISTRIBUTABLE_RELEASES
+    )
+    return result
+
+
+def newest_local_release_for_major(major: int) -> Optional[Dict[str, Any]]:
+    best = None
+    for sc in list_local_releases():
+        ver = sc.get('version') or '0.0.0'
+        if int(_release_version_tuple(ver)[0]) != int(major):
+            continue
+        if best is None or _release_version_tuple(ver) > _release_version_tuple(best.get('version', '0')):
+            best = sc
+    return best
+
+
+def release_catalog_entries(major_filter: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Metadata-only catalog for peer discovery (no package bytes)."""
+    entries = []
+    for sc in list_local_releases():
+        ver = sc.get('version') or '0.0.0'
+        maj = int(_release_version_tuple(ver)[0])
+        kind = str(sc.get('kind') or '')
+        # Majors may bump major digit; still advertise when filter is None or matches
+        # installed train peers ask with their major — also include kind=major newer majors.
+        if major_filter is not None and maj != int(major_filter) and kind.lower() != 'major':
+            continue
+        if (
+            major_filter is not None
+            and kind.lower() == 'major'
+            and maj < int(major_filter)
+        ):
+            continue
+        entry = {
+            'release_id': sc.get('release_id', ''),
+            'version': ver,
+            'kind': kind,
+            'major': maj,
+            # Default cumulative only for minor; patches set it explicitly at build.
+            'cumulative': bool(sc.get('cumulative', sc.get('kind') == 'minor')),
+            'covers_from': sc.get('covers_from') or effective_covers_from(sc),
+            'channel': sc.get('channel', 'prod'),
+            'package_size': int(sc.get('package_size') or 0),
+            'enc_sha512': sc.get('enc_sha512', ''),
+            'notes': sc.get('notes', ''),
+            'created_utc': sc.get('created_utc', ''),
+            'transport': sc.get('transport') or (
+                'piece_swarm' if kind.lower() == 'major' else 'nrel'
+            ),
+        }
+        # Swarm metadata for 4GB+ majors (never sent via CMD_APP_PKG).
+        if sc.get('file_hash'):
+            entry['file_hash'] = sc.get('file_hash')
+            entry['piece_size'] = int(sc.get('piece_size') or 0)
+            entry['piece_hashes'] = list(sc.get('piece_hashes') or [])
+            entry['artifact_name'] = sc.get('artifact_name') or 'Neuron.rar'
+            if sc.get('ops'):
+                entry['ops'] = sc.get('ops')
+            if sc.get('seed_urls'):
+                entry['seed_urls'] = list(sc.get('seed_urls') or [])
+        entries.append(entry)
+    entries.sort(key=lambda e: _release_version_tuple(e.get('version', '0.0.0')), reverse=True)
+    return entries
+
+
+def store_verified_release_bytes(enc_bytes: bytes, release_id: str = '', version: str = '') -> Tuple[bool, str, Dict[str, Any]]:
+    """Verify, store .nrel + sidecar, stage if newer. Used by pull/seed paths."""
+    from Support.Header import PATH_DISTRIBUTABLE_RELEASES, PATH_RELEASE_PUBKEY
+
+    ok, manifest, zip_bytes, message = unlock_and_verify_release(enc_bytes, PATH_RELEASE_PUBKEY)
+    if not ok:
+        return False, message, {}
+    rid = release_id or manifest.get('release_id', '')
+    if not rid:
+        return False, "missing release_id", {}
+    if manifest.get('release_id') and manifest.get('release_id') != rid:
+        return False, "release_id mismatch", {}
+
+    try:
+        from Support.Header import MAIN_PATH
+        from Support.ChangeManagement import channel_matches, local_channel
+        pkg_ch = manifest.get('channel', 'prod')
+        if not channel_matches(pkg_ch, MAIN_PATH):
+            return False, f"channel mismatch: package={pkg_ch} local={local_channel(MAIN_PATH)}", {}
+    except Exception:
+        pass
+
+    os.makedirs(PATH_DISTRIBUTABLE_RELEASES, exist_ok=True)
+    enc_path = os.path.join(PATH_DISTRIBUTABLE_RELEASES, rid + '.nrel')
+    with open(enc_path, 'wb') as f:
+        f.write(bytes(enc_bytes))
+
+    sidecar = {
+        'release_id': rid,
+        'version': version or manifest.get('version', ''),
+        'created_utc': manifest.get('created_utc', ''),
+        'requires_restart': manifest.get('requires_restart', True),
+        'notes': manifest.get('notes', ''),
+        'channel': manifest.get('channel', 'prod'),
+        'kind': manifest.get('kind', ''),
+        'cumulative': bool(manifest.get('cumulative', False)),
+        'covers_from': manifest.get('covers_from', ''),
+        'major': manifest.get('major', int(_release_version_tuple(manifest.get('version', '0'))[0])),
+        'enc_file': rid + '.nrel',
+        'zip_sha512': calculate_release_hash(zip_bytes) if zip_bytes else '',
+        'enc_sha512': calculate_release_hash(bytes(enc_bytes)),
+        'verified': True,
+        'package_size': len(bytes(enc_bytes)),
+    }
+    save_release_sidecar(rid, sidecar)
+
+    staged = False
+    stage_msg = ''
+    if is_release_newer_than_installed(manifest.get('version', '0.0.0')):
+        if same_major_as_installed(manifest.get('version', '0.0.0')) or manifest.get('kind') == 'major':
+            staged, stage_msg = stage_release_from_package(manifest, zip_bytes)
+            if staged:
+                sidecar['staged'] = True
+                sidecar['staged_utc'] = manifest.get('created_utc', '')
+                save_release_sidecar(rid, sidecar)
+                if manifest.get('requires_restart', True):
+                    _notify_release_restart(
+                        version=str(manifest.get('version') or version or ''),
+                        kind=str(manifest.get('kind') or 'patch'),
+                        notes=str(manifest.get('notes') or ''),
+                    )
+    else:
+        stage_msg = "stored (not newer than installed)"
+    return True, stage_msg or "accepted", sidecar
+
+
+def same_major_as_installed(version_str: str) -> bool:
+    inst = _release_version_tuple(get_installed_release_version())
+    other = _release_version_tuple(version_str)
+    return int(inst[0]) == int(other[0])
+
+
+def advertise_release_to_peers(version: str, release_id: str = '') -> int:
+    """
+    Gossip: tell peers a newer release exists (they CAT/GET or piece-swarm).
+    Prefer supernodes first, then all online peers; queue offline for later flush.
+    """
+    try:
+        from Support.Header import (
+            ME, PEERS, CMD_APP_ADV, PRT_NOR,
+            NODE_TYPE_DB_SERVER, NODE_TYPE_SUPER_DB_SERVER, NODE_TYPE_APP_SERVER,
+        )
+        from Support.Utils import ip_to_send_packet_to
+        from Support.SendData import send_packet
+        from Support.MajorUpgrade import queue_pending_adv
+        if not ME or not version:
+            return 0
+        payload = build_adv_payload(version, release_id)
+        supers = []
+        leaves = []
+        offline_ids = []
+        for peer in PEERS or []:
+            pid = str(peer.get('peer_id') or peer.get('id') or '')
+            online = int(peer.get('online') or 0) == 1
+            if not online:
+                if pid:
+                    offline_ids.append(pid)
+                continue
+            if peer.get('type') in (
+                NODE_TYPE_DB_SERVER, NODE_TYPE_SUPER_DB_SERVER, NODE_TYPE_APP_SERVER
+            ):
+                supers.append(peer)
+            else:
+                leaves.append(peer)
+        sent = 0
+        for peer in supers + leaves:
+            try:
+                send_packet(
+                    ME['ip'], ME['ip_local'], '',
+                    ip_to_send_packet_to(peer['ip'], peer['ip_local']), peer['ip_local'], '',
+                    CMD_APP_ADV, PRT_NOR, '', 0, 0, '',
+                    payload, [], [], '', '', [], [], []
+                )
+                sent += 1
+            except Exception:
+                if peer.get('peer_id') or peer.get('id'):
+                    offline_ids.append(str(peer.get('peer_id') or peer.get('id')))
+        if offline_ids:
+            try:
+                queue_pending_adv(version, release_id, offline_ids)
+            except Exception:
+                pass
+        return sent
+    except Exception:
+        return 0
 
 
 def _rewrite_actions_for_bundle(actions: List[Dict[str, Any]], files_dir: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -2488,9 +3598,7 @@ def build_release_package(release: Dict[str, Any],
         for mod in release.get('modules', []):
             data = mod.get('src_bytes')
             if data is None:
-                src_path = mod['src_path']
-                with open(src_path, 'rb') as f:
-                    data = f.read()
+                data = read_binary_even_if_locked(mod['src_path'])
             sub_folder = _normalize_module_subfolder(mod.get('sub_folder') or '')
             name = mod['name']
             if sub_folder:
@@ -2518,10 +3626,17 @@ def build_release_package(release: Dict[str, Any],
             if not action.get('original_release_id'):
                 action['original_release_id'] = release_id
 
+        ver = release.get('version', '0.0.0')
+        maj = int(release.get('major') or _release_version_tuple(ver)[0])
+        kind = (release.get('kind') or 'minor').strip().lower()
+        cumulative = bool(release.get('cumulative', kind == 'minor'))
+        covers_from = release.get('covers_from') or (
+            f"{maj}.0.0" if cumulative else ver
+        )
         manifest = {
             'format_version': '5.0',
             'release_id': release_id,
-            'version': release.get('version', '0.0.0'),
+            'version': ver,
             'created_utc': release.get('created_utc', ''),
             'admin_ip': release.get('admin_ip', ''),
             'requires_restart': bool(release.get('requires_restart', True)),
@@ -2533,6 +3648,10 @@ def build_release_package(release: Dict[str, Any],
             'payloads': payloads,
             'actions': actions,
             'channel': release.get('channel', 'prod'),
+            'kind': kind,
+            'cumulative': cumulative,
+            'covers_from': covers_from,
+            'major': maj,
         }
 
         manifest_bytes = json.dumps(manifest, separators=(',', ':'), sort_keys=True).encode('utf-8')
@@ -2564,9 +3683,16 @@ def build_release_package(release: Dict[str, Any],
             'requires_restart': manifest['requires_restart'],
             'notes': manifest['notes'],
             'channel': manifest.get('channel', 'prod'),
+            'kind': manifest.get('kind', ''),
+            'cumulative': bool(manifest.get('cumulative', False)),
+            'covers_from': manifest.get('covers_from', ''),
+            'major': manifest.get('major', maj),
             'enc_file': release_id + '.nrel',
             'zip_sha512': _calculate_release_hash(zip_bytes),
-            'enc_sha512': _calculate_release_hash(enc_bytes)
+            'enc_sha512': _calculate_release_hash(enc_bytes),
+            'package_size': len(enc_bytes),
+            'verified': True,
+            'transport': 'nrel',
         }
         with open(os.path.join(releases_dir, release_id + '.json'), 'w', encoding='utf-8') as f:
             json.dump(sidecar, f, indent=2)
@@ -2631,7 +3757,10 @@ def delete_local_release(release_id: str) -> Tuple[bool, str]:
 
 
 def list_local_releases() -> List[Dict[str, Any]]:
-    """Return release sidecars that have a matching .nrel package, newest first."""
+    """
+    Return holdable release sidecars, newest first.
+    Includes .nrel packages and major piece-swarm entries (file_hash / artifact).
+    """
     from Support.Header import PATH_DISTRIBUTABLE_RELEASES
     results = []
     if not os.path.isdir(PATH_DISTRIBUTABLE_RELEASES):
@@ -2640,22 +3769,42 @@ def list_local_releases() -> List[Dict[str, Any]]:
         if not fname.endswith('.json'):
             continue
         release_id = fname[:-5]
-        nrel = os.path.join(PATH_DISTRIBUTABLE_RELEASES, release_id + '.nrel')
-        if not os.path.isfile(nrel):
-            continue
         sc = load_release_sidecar(release_id)
         if not sc:
             continue
         sc['release_id'] = sc.get('release_id') or release_id
-        sc['_nrel_path'] = nrel
-        try:
-            sc['package_size'] = os.path.getsize(nrel)
-        except Exception:
-            sc['package_size'] = int(sc.get('package_size') or 0)
+        kind = str(sc.get('kind') or '').lower()
+        is_swarm = (
+            kind == 'major'
+            or str(sc.get('transport') or '') == 'piece_swarm'
+            or bool(sc.get('file_hash'))
+        )
+        nrel = os.path.join(
+            PATH_DISTRIBUTABLE_RELEASES,
+            sc.get('enc_file') or (release_id + '.nrel')
+        )
+        art = sc.get('artifact_path') or ''
+        if os.path.isfile(nrel):
+            sc['_nrel_path'] = nrel
+            try:
+                sc['package_size'] = os.path.getsize(nrel)
+            except Exception:
+                sc['package_size'] = int(sc.get('package_size') or 0)
+        elif is_swarm:
+            if art and os.path.isfile(art):
+                try:
+                    sc['package_size'] = int(sc.get('package_size') or os.path.getsize(art))
+                except Exception:
+                    sc['package_size'] = int(sc.get('package_size') or 0)
+            elif not sc.get('file_hash'):
+                continue
+            sc['transport'] = sc.get('transport') or 'piece_swarm'
+        else:
+            continue
         results.append(sc)
 
     def sort_key(item):
-        return str(item.get('created_utc') or '')
+        return _release_version_tuple(item.get('version') or '0.0.0')
 
     results.sort(key=sort_key, reverse=True)
     return results
@@ -2738,6 +3887,118 @@ def update_systeminfo_version(version_str: str) -> bool:
         return False
 
 
+def clear_install_history() -> None:
+    """Wipe local install_history.jsonl (release train rewind)."""
+    path = install_history_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('')
+        print('[RELEASE] install_history cleared')
+    except Exception as e:
+        print(f'[RELEASE] clear install_history warn: {e}')
+
+
+def reset_local_release_train(version: str = '0.0.0') -> str:
+    """
+    Set SystemInfo to version, clear install history, skip older local packages,
+    and clear any armed major wanted_release. Used before the pre-1.0.0 patch era.
+    """
+    ver = str(version or '0.0.0').strip() or '0.0.0'
+    update_systeminfo_version(ver)
+    clear_install_history()
+    try:
+        from Support.MajorUpgrade import clear_wanted_release
+        clear_wanted_release()
+    except Exception as e:
+        print(f'[RELEASE] clear wanted warn: {e}')
+    # Prevent old 15.x/16.x sidecars from looking "newer" than the reset train.
+    try:
+        for sc in list_local_releases():
+            sc_ver = str(sc.get('version') or '')
+            rid = str(sc.get('release_id') or '')
+            if not rid:
+                continue
+            if _release_version_tuple(sc_ver) > _release_version_tuple(ver):
+                sc['store_skip'] = True
+                sc['store_skip_reason'] = 'train_reset_superseded'
+                sc['installed'] = True
+                save_release_sidecar(rid, sc)
+    except Exception as e:
+        print(f'[RELEASE] sidecar train reset warn: {e}')
+    print(f'[RELEASE] local release train reset to {ver}')
+    return ver
+
+
+def install_history_path() -> str:
+    from Support.Header import PATH_DISTRIBUTABLE_RELEASES
+    return os.path.join(PATH_DISTRIBUTABLE_RELEASES, 'install_history.jsonl')
+
+
+def append_install_history(entry: Dict[str, Any]) -> None:
+    """Append one install event (no DB). Safe to call from any finalize path."""
+    from datetime import datetime, timezone
+    row = dict(entry or {})
+    if not row.get('installed_utc'):
+        row['installed_utc'] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        path = install_history_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(row, ensure_ascii=True) + '\n')
+    except Exception as e:
+        print(f"[RELEASE] install_history append warn: {e}")
+
+
+def list_install_history(limit: int = 200) -> List[Dict[str, Any]]:
+    """Newest-first history from jsonl + installed sidecars (deduped by release_id)."""
+    rows: List[Dict[str, Any]] = []
+    seen = set()
+    path = install_history_path()
+    if os.path.isfile(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = (line or '').strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(obj, dict):
+                        rows.append(obj)
+        except Exception:
+            pass
+    for sc in list_local_releases():
+        if not sc.get('installed'):
+            continue
+        rid = sc.get('release_id', '')
+        rows.append({
+            'release_id': rid,
+            'version': sc.get('version', ''),
+            'kind': sc.get('kind', ''),
+            'notes': sc.get('notes', ''),
+            'installed_utc': sc.get('installed_utc', ''),
+            'package_size': sc.get('package_size', 0),
+        })
+    # Newest first; keep first occurrence of each release_id
+    def _key(r):
+        return str(r.get('installed_utc') or '')
+    rows.sort(key=_key, reverse=True)
+    out = []
+    for r in rows:
+        rid = str(r.get('release_id') or '')
+        dedupe = rid or (str(r.get('version')) + '|' + str(r.get('installed_utc')))
+        if dedupe in seen:
+            continue
+        seen.add(dedupe)
+        out.append(r)
+        if limit and len(out) >= int(limit):
+            break
+    return out
+
+
 def mark_release_installed(release_id: str, version: str = '', package_size: int = 0) -> None:
     """Persist install completion on the release sidecar."""
     from datetime import datetime, timezone
@@ -2760,6 +4021,14 @@ def mark_release_installed(release_id: str, version: str = '', package_size: int
                 pass
     sidecar['staged'] = True
     save_release_sidecar(release_id, sidecar)
+    append_install_history({
+        'release_id': release_id,
+        'version': sidecar.get('version', version or ''),
+        'kind': sidecar.get('kind', ''),
+        'notes': sidecar.get('notes', ''),
+        'installed_utc': sidecar.get('installed_utc', ''),
+        'package_size': int(sidecar.get('package_size') or 0),
+    })
 
 
 def modules_have_pending_updates() -> bool:
@@ -2802,6 +4071,11 @@ def finalize_applied_releases() -> None:
         )
     update_systeminfo_version(highest)
     print(f"[RELEASE] Finalized {len(to_finalize)} release(s); SystemInfo -> {highest}")
+    try:
+        rid = to_finalize[-1].get('release_id', '')
+        advertise_release_to_peers(highest, rid)
+    except Exception:
+        pass
 
 
 def prepare_pending_releases_for_install() -> Tuple[bool, str, List[str], bool]:
@@ -2957,30 +4231,29 @@ def get_release_seed_peers(release_id: str, status_filter: Optional[str] = None)
     return peers
 
 
-def unlock_and_verify_release(enc_bytes: bytes, pubkey_path: str) -> Tuple[bool, Optional[Dict[str, Any]], Optional[bytes], str]:
+def verify_signed_release_zip(zip_bytes: bytes, pubkey_path: str = '') -> Tuple[bool, Optional[Dict[str, Any]], Optional[bytes], str]:
     """
-    Decrypt release package with app key, verify Ed25519 manifest signature,
-    and verify every module/payload sha512 listed in the manifest.
+    Verify a plaintext signed release zip (manifest.json + manifest.sig + payloads).
+    No AES decrypt — used for mapped Tower copies and chunked zip deploy.
 
     Returns (ok, manifest_dict, zip_bytes, message)
     """
     import io
     import zipfile
-    from Support.EncDec import decrypt_bytes
+    from Support.Header import PATH_RELEASE_PUBKEY
 
-    try:
-        zip_bytes = decrypt_bytes(enc_bytes)
-    except Exception as e:
-        return False, None, None, f"decrypt failed: {e}"
-
+    if not zip_bytes:
+        return False, None, None, "empty zip"
+    key_path = pubkey_path or PATH_RELEASE_PUBKEY
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
-            if 'manifest.json' not in zf.namelist() or 'manifest.sig' not in zf.namelist():
+            names = zf.namelist()
+            if 'manifest.json' not in names or 'manifest.sig' not in names:
                 return False, None, None, "manifest missing from package"
             manifest_bytes = zf.read('manifest.json')
             signature = zf.read('manifest.sig')
 
-            if not _verify_manifest(manifest_bytes, signature, pubkey_path):
+            if not _verify_manifest(manifest_bytes, signature, key_path):
                 return False, None, None, "Ed25519 signature invalid"
 
             manifest = json.loads(manifest_bytes.decode('utf-8'))
@@ -2990,7 +4263,7 @@ def unlock_and_verify_release(enc_bytes: bytes, pubkey_path: str) -> Tuple[bool,
                 expected = entry.get('sha512')
                 if not rel or not expected:
                     return False, None, None, "manifest entry incomplete"
-                if rel not in zf.namelist():
+                if rel not in names:
                     return False, None, None, f"missing payload {rel}"
                 actual = _calculate_release_hash(zf.read(rel))
                 if actual != expected:
@@ -2999,6 +4272,22 @@ def unlock_and_verify_release(enc_bytes: bytes, pubkey_path: str) -> Tuple[bool,
             return True, manifest, zip_bytes, "ok"
     except Exception as e:
         return False, None, None, f"verify failed: {e}"
+
+
+def unlock_and_verify_release(enc_bytes: bytes, pubkey_path: str) -> Tuple[bool, Optional[Dict[str, Any]], Optional[bytes], str]:
+    """
+    Decrypt release package with app key, then verify the signed zip contents.
+
+    Returns (ok, manifest_dict, zip_bytes, message)
+    """
+    from Support.EncDec import decrypt_bytes
+
+    try:
+        zip_bytes = decrypt_bytes(enc_bytes)
+    except Exception as e:
+        return False, None, None, f"decrypt failed: {e}"
+
+    return verify_signed_release_zip(zip_bytes, pubkey_path)
 
 
 def _release_version_tuple(version_str: str) -> Tuple[int, ...]:
@@ -3059,8 +4348,23 @@ def stage_release_from_package(manifest: Dict[str, Any], zip_bytes: bytes) -> Tu
     except Exception:
         pass
 
+    installed = get_installed_release_version()
     if not is_release_newer_than_installed(release_version):
-        return False, f"version {release_version} not newer than installed {get_installed_release_version()}"
+        return False, f"version {release_version} not newer than installed {installed}"
+
+    # OTA packages stay on the same major; major jumps use Neuron.rar / NeuronSetup.
+    if manifest.get('kind') != 'major' and not same_major_as_installed(release_version):
+        return False, (
+            f"major mismatch: package {release_version} vs installed {installed} "
+            f"(install new Neuron.rar for a new major)"
+        )
+
+    if not release_applicable_to_installed(manifest, installed):
+        floor = effective_covers_from(manifest)
+        return False, (
+            f"package {release_version} requires installed >= {floor} "
+            f"(have {installed})"
+        )
 
     backup_folder = os.path.join(MAIN_PATH, "System", "Bak")
     old_folder = os.path.join(MAIN_PATH, "System", "Old")
@@ -3120,6 +4424,9 @@ def stage_release_from_package(manifest: Dict[str, Any], zip_bytes: bytes) -> Tu
                 except Exception as e:
                     print(f"[RELEASE] Warning: could not backup {name}: {e}")
 
+            # Drop tagged siblings now so restart cannot keep loading an old .cp312-*.pyd
+            remove_stale_module_binaries(module_dir, name, keep_path=current_module_path)
+
             pending_path = os.path.join(module_dir, name + '.pending')
             with open(pending_path, 'wb') as f:
                 f.write(module_data)
@@ -3157,17 +4464,73 @@ def stage_release_from_package(manifest: Dict[str, Any], zip_bytes: bytes) -> Tu
     return True, "staged"
 
 
-def process_stored_releases() -> None:
-    """Stage any verified .nrel sidecars not yet applied (e.g. after overnight store-only)."""
+def _mark_release_store_skip(sidecar_path: str, sidecar: Dict[str, Any], reason: str) -> None:
+    """Persist a permanent store-skip so APP_UPDATE never re-hashes this package."""
     from datetime import datetime, timezone
-    from Support.Header import PATH_DISTRIBUTABLE_RELEASES, PATH_RELEASE_PUBKEY
     import json
+    sidecar['store_skip'] = True
+    sidecar['store_skip_reason'] = (reason or 'skipped')[:240]
+    sidecar['store_skip_utc'] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(sidecar_path, 'w', encoding='utf-8') as f:
+            json.dump(sidecar, f, indent=2)
+    except Exception:
+        pass
+
+
+def _sidecar_worth_opening(sidecar: Dict[str, Any], installed: str) -> Tuple[bool, str]:
+    """
+    Cheap pre-filter using sidecar fields only (no zip I/O).
+    Returns (ok, reason_if_not).
+    """
+    ver = str(sidecar.get('version') or '0.0.0')
+    if _release_version_tuple(ver) <= _release_version_tuple(installed):
+        return False, f"version {ver} not newer than installed {installed}"
+    kind = str(sidecar.get('kind') or '').lower()
+    if kind != 'major' and not same_major_as_installed(ver):
+        return False, (
+            f"major mismatch: package {ver} vs installed {installed}"
+        )
+    floor = str(sidecar.get('covers_from') or '').strip()
+    if floor and _release_version_tuple(installed) < _release_version_tuple(floor):
+        return False, f"package {ver} requires installed >= {floor} (have {installed})"
+    return True, ''
+
+
+def process_stored_releases() -> None:
+    """Stage unapplied release sidecars (prefer plaintext .zip over .nrel decrypt).
+
+    Must stay cheap: peers with a large Releases outbox were hanging because every
+    APP_UPDATE/startup re-read and crypto-verified every unstaged zip.
+    """
+    from datetime import datetime, timezone
+    from Support.Header import PATH_DISTRIBUTABLE_RELEASES, PATH_RELEASE_PUBKEY, MAIN_PATH
+    import json
+
+    # Promote / local Neuron.rar: arm before zip scan (APP_UPDATE is hourly).
+    try:
+        from Support.MajorUpgrade import try_arm_local_neuron_rar
+        armed, amsg = try_arm_local_neuron_rar()
+        if armed:
+            print(f"[RELEASE] local Neuron.rar: {amsg}")
+    except Exception as e:
+        print(f"[RELEASE] local Neuron.rar arm: {e}")
 
     if not os.path.isdir(PATH_DISTRIBUTABLE_RELEASES):
         return
 
+    installed = get_installed_release_version()
+    try:
+        from Support.ChangeManagement import channel_matches
+    except Exception:
+        channel_matches = None
+
+    pending = []
     for fname in os.listdir(PATH_DISTRIBUTABLE_RELEASES):
         if not fname.endswith('.json'):
+            continue
+        # Skip huge major catalogs / wanted helpers — never stage payloads.
+        if fname in ('wanted_release.json', 'pending_adv.json'):
             continue
         sidecar_path = os.path.join(PATH_DISTRIBUTABLE_RELEASES, fname)
         try:
@@ -3175,51 +4538,868 @@ def process_stored_releases() -> None:
                 sidecar = json.load(f)
         except Exception:
             continue
+        if not isinstance(sidecar, dict):
+            continue
+
+        if sidecar.get('staged') or sidecar.get('installed'):
+            continue
+        if sidecar.get('store_skip') or sidecar.get('verify_failed'):
+            continue
+        if str(sidecar.get('kind') or '').lower() == 'major':
+            continue
+        if str(sidecar.get('transport') or '') == 'piece_swarm':
+            continue
+
+        if channel_matches is not None:
+            try:
+                pkg_ch = sidecar.get('channel', 'prod')
+                if not channel_matches(pkg_ch, MAIN_PATH):
+                    continue
+            except Exception:
+                pass
+
+        worth, _why = _sidecar_worth_opening(sidecar, installed)
+        if not worth:
+            continue
+
+        rid = sidecar.get('release_id') or os.path.splitext(fname)[0]
+        zip_path = os.path.join(PATH_DISTRIBUTABLE_RELEASES, rid + '.zip')
+        enc_name = sidecar.get('enc_file') or (rid + '.nrel')
+        enc_path = os.path.join(PATH_DISTRIBUTABLE_RELEASES, enc_name)
+        has_zip = os.path.isfile(zip_path)
+        has_nrel = os.path.isfile(enc_path)
+
+        # Prefer zip: retries prior nrel decrypt failures when .zip is present.
+        if has_zip:
+            pending.append((sidecar_path, sidecar, 'zip', zip_path))
+            continue
 
         if not sidecar.get('verified'):
             continue
-        if sidecar.get('staged'):
+        if not has_nrel:
             continue
+        pending.append((sidecar_path, sidecar, 'nrel', enc_path))
 
-        enc_name = sidecar.get('enc_file') or (sidecar.get('release_id', '') + '.nrel')
-        enc_path = os.path.join(PATH_DISTRIBUTABLE_RELEASES, enc_name)
-        if not os.path.isfile(enc_path):
-            continue
+    # Newest applicable first; at most one heavy verify/stage per call.
+    pending.sort(
+        key=lambda t: _release_version_tuple(t[1].get('version') or '0.0.0'),
+        reverse=True,
+    )
+    pending = pending[:1]
 
-        with open(enc_path, 'rb') as f:
-            enc_bytes = f.read()
+    for sidecar_path, sidecar, transport, pkg_path in pending:
+        rid = sidecar.get('release_id') or os.path.splitext(os.path.basename(sidecar_path))[0]
+        if transport == 'zip':
+            try:
+                with open(pkg_path, 'rb') as f:
+                    raw = f.read()
+            except Exception as e:
+                print(f"[RELEASE] Failed to read zip {rid}: {e}")
+                continue
+            ok, manifest, zip_bytes, message = verify_signed_release_zip(
+                raw, PATH_RELEASE_PUBKEY
+            )
+        else:
+            try:
+                with open(pkg_path, 'rb') as f:
+                    enc_bytes = f.read()
+            except Exception as e:
+                print(f"[RELEASE] Failed to read nrel {rid}: {e}")
+                continue
+            ok, manifest, zip_bytes, message = unlock_and_verify_release(
+                enc_bytes, PATH_RELEASE_PUBKEY
+            )
 
-        ok, manifest, zip_bytes, message = unlock_and_verify_release(enc_bytes, PATH_RELEASE_PUBKEY)
         if not ok:
-            print(f"[RELEASE] Stored release verify failed: {message}")
+            reason = (message or 'unknown').strip() or 'unknown'
+            sidecar['verified'] = False
+            sidecar['verify_failed'] = True
+            sidecar['verify_failed_utc'] = datetime.now(timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            sidecar['verify_failed_reason'] = reason
+            _mark_release_store_skip(sidecar_path, sidecar, reason)
+            print(
+                f"[RELEASE] Stored release verify failed ({rid}): "
+                f"{reason} - marked, will not retry"
+            )
             continue
 
         staged_ok, stage_msg = stage_release_from_package(manifest, zip_bytes)
         if staged_ok:
+            sidecar['verified'] = True
             sidecar['staged'] = True
             sidecar['staged_utc'] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            sidecar['transport'] = 'zip' if transport == 'zip' else sidecar.get('transport', 'nrel')
+            sidecar.pop('verify_failed', None)
+            sidecar.pop('verify_failed_utc', None)
+            sidecar.pop('verify_failed_reason', None)
+            sidecar.pop('store_skip', None)
+            sidecar.pop('store_skip_reason', None)
+            sidecar.pop('store_skip_utc', None)
             try:
-                sidecar['package_size'] = os.path.getsize(enc_path)
+                sidecar['package_size'] = os.path.getsize(pkg_path)
             except Exception:
                 pass
+            for key in ('kind', 'cumulative', 'covers_from', 'major', 'channel'):
+                if manifest.get(key) is not None and manifest.get(key) != '':
+                    sidecar[key] = manifest.get(key)
             with open(sidecar_path, 'w', encoding='utf-8') as f:
                 json.dump(sidecar, f, indent=2)
-            _notify_release_restart()
+            try:
+                advertise_release_to_peers(
+                    sidecar.get('version') or manifest.get('version', ''),
+                    sidecar.get('release_id') or manifest.get('release_id', '')
+                )
+            except Exception:
+                pass
+            print(f"[RELEASE] Staged stored package {rid} via {transport}: {stage_msg}")
+            _notify_release_restart(
+                version=str(sidecar.get('version') or manifest.get('version') or ''),
+                kind=str(sidecar.get('kind') or manifest.get('kind') or 'patch'),
+                notes=str(
+                    sidecar.get('notes') or manifest.get('notes') or ''
+                ),
+            )
+        else:
+            _mark_release_store_skip(sidecar_path, sidecar, stage_msg or 'store-only')
+            print(f"[RELEASE] Store-only {rid} via {transport}: {stage_msg}")
 
 
-def _notify_release_restart():
-    """Show green restart prompt on the taskbar tickertape (UI thread safe)."""
+# Auto-restart after module/package stage: only when user has been idle this long,
+# then offer a non-modal countdown before restarting.
+UPDATE_RESTART_IDLE_SECONDS = 120
+UPDATE_RESTART_COUNTDOWN_SECONDS = 10
+UPDATE_RESTART_IDLE_POLL_MS = 15000
+
+_restart_prompt_active = False
+_restart_idle_watcher = None
+_restart_countdown_dialog = None
+_restart_notice_version = ''
+_restart_notice_kind = ''
+_restart_notice_notes = ''
+
+
+def _user_idle_seconds() -> float:
+    """Seconds since last keyboard/mouse input (Windows). 0 if unknown."""
+    if os.name != 'nt':
+        return 0.0
     try:
-        import Support.Header as init
-        from PySide6.QtCore import QTimer, QCoreApplication
-        message = "     Neuron was updated. Please restart the app."
-        text = (init.taskbar_scrolling_text or '') + (
-            "<span style='color: green; font-weight: bold;'>" + message + "</span><br>")
+        import ctypes
+        from ctypes import wintypes
 
-        def _apply():
+        class LASTINPUTINFO(ctypes.Structure):
+            _fields_ = [('cbSize', wintypes.UINT), ('dwTime', wintypes.DWORD)]
+
+        info = LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(LASTINPUTINFO)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return 0.0
+        tick = ctypes.windll.kernel32.GetTickCount()
+        idle_ms = int(tick) - int(info.dwTime)
+        if idle_ms < 0:
+            idle_ms = 0
+        return idle_ms / 1000.0
+    except Exception:
+        return 0.0
+
+
+def _apply_staged_pending_on_disk(root):
+    """Swap *.pending -> *.pyd under install root (Neuron + Support) after exit.
+
+    Used by the update relauncher so patches apply before the new process starts,
+    avoiding a race with the hard-exit Neuron.pending reaper.
+    """
+    root = os.path.normpath(root or '')
+    if not root or not os.path.isdir(root):
+        return 0
+
+    def _swap(pending_path, target_path):
+        if not os.path.isfile(pending_path):
+            return False
+        try:
+            with open(pending_path, 'rb') as fh:
+                if fh.read(2) != b'MZ':
+                    return False
+            if os.path.isfile(target_path):
+                try:
+                    os.remove(target_path)
+                except OSError:
+                    return False
+            os.rename(pending_path, target_path)
+            return True
+        except OSError:
+            return False
+
+    applied = 0
+    if _swap(os.path.join(root, 'Neuron.pending'), os.path.join(root, 'Neuron.pyd')):
+        applied += 1
+    support = os.path.join(root, 'Support')
+    walk_roots = [root, support] if os.path.isdir(support) else [root]
+    seen = set()
+    for base in walk_roots:
+        for dirpath, _dirs, files in os.walk(base):
+            # Only top-level Support (and root); skip deep nests / venv noise.
+            rel = os.path.relpath(dirpath, root)
+            if rel != '.' and not rel.replace('\\', '/').startswith('Support'):
+                continue
+            if rel.replace('\\', '/').count('/') > 1:
+                continue
+            for name in files:
+                if not name.endswith('.pending'):
+                    continue
+                pending_path = os.path.join(dirpath, name)
+                if pending_path in seen:
+                    continue
+                seen.add(pending_path)
+                stem = name[:-8]
+                if _swap(pending_path, os.path.join(dirpath, stem + '.pyd')):
+                    applied += 1
+    return applied
+
+
+def _spawn_update_relauncher(pid, create_low, create_high, main_path, launch_cmd_list):
+    """
+    Detached helper: wait until this Neuron PID is gone, then start Neuron again.
+
+    Must NOT be our child — force_kill_children_on_exit walks psutil children and
+    kills them on shutdown. Spawn via WMI Win32_Process.Create (parent = WmiPrvSE)
+    so the waiter survives. Pure .bat + tasklist avoids OpenProcess false-negatives.
+    """
+    staging = os.environ.get('TEMP') or os.environ.get('TMP') or os.path.join(
+        main_path or os.getcwd(), 'System', 'temp'
+    )
+    os.makedirs(staging, exist_ok=True)
+    tag = str(int(pid))
+    bat_path = os.path.join(staging, f'neuron_relaunch_{tag}.bat')
+    log_path = os.path.join(staging, f'neuron_relaunch_{tag}.log')
+    apply_py_path = os.path.join(staging, f'neuron_apply_pending_{tag}.py')
+
+    cwd = os.path.normpath(main_path or os.getcwd())
+    cmd = [str(x) for x in (launch_cmd_list or []) if str(x)]
+    if not cmd:
+        raise RuntimeError('empty relaunch command')
+
+    def _q(s):
+        s = str(s)
+        if not s:
+            return '""'
+        if any(ch in s for ch in ' \t&()[]{}^=;!\'+,`~'):
+            return '"' + s.replace('"', '') + '"'
+        return s
+
+    # Prefer pythonw for the pending-apply helper (no console flash).
+    apply_py = _pythonw_for_relaunch()
+    notice_ver = str(_restart_notice_version or '').replace("'", "")
+    notice_notes = str(_restart_notice_notes or '').replace("\\", "\\\\").replace("'", "\\'")
+    apply_script = (
+        "import os, sys\n"
+        f"root = r'{cwd}'\n"
+        "os.environ['NEURON_OFFLINE_APPLY'] = '1'\n"
+        "if root and root not in sys.path:\n"
+        "    sys.path.insert(0, root)\n"
+        "ui = None\n"
+        "old_ver = ''\n"
+        f"new_ver = '{notice_ver}'\n"
+        f"notes = '{notice_notes}'\n"
+        "try:\n"
+        "    from Support.ModuleSecurity import get_installed_release_version\n"
+        "    old_ver = str(get_installed_release_version() or '')\n"
+        "except Exception:\n"
+        "    old_ver = ''\n"
+        "if not new_ver:\n"
+        "    try:\n"
+        "        from Support.MajorUpgrade import get_wanted_release\n"
+        "        w = get_wanted_release() or {}\n"
+        "        new_ver = str(w.get('version') or '')\n"
+        "    except Exception:\n"
+        "        new_ver = ''\n"
+        "mods = []\n"
+        "try:\n"
+        "    from datetime import datetime, timezone\n"
+        "    from Support.MajorInstall import ApplyProgressUI\n"
+        "    stamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')\n"
+        "    ui = ApplyProgressUI(title='Neuron update', old_version=old_ver, new_version=new_ver or old_ver, timestamp=stamp, notes=notes, neuron_root=root)\n"
+        "    ui.update(0.05, 'Applying staged modules...', 0.0, '')\n"
+        "except Exception:\n"
+        "    ui = None\n"
+        "def _prog(frac, msg, file_frac=None, current_file=''):\n"
+        "    if ui is None: return\n"
+        "    try: ui.update(frac, msg, file_fraction=file_frac, current_file=current_file)\n"
+        "    except Exception: pass\n"
+        "def swap(p, t):\n"
+        "    if not os.path.isfile(p): return False\n"
+        "    try:\n"
+        "        with open(p,'rb') as f:\n"
+        "            if f.read(2) != b'MZ': return False\n"
+        "        if os.path.isfile(t):\n"
+        "            try: os.remove(t)\n"
+        "            except OSError: return False\n"
+        "        os.rename(p, t); return True\n"
+        "    except OSError: return False\n"
+        "n = 0\n"
+        "pending = []\n"
+        "if os.path.isfile(os.path.join(root,'Neuron.pending')):\n"
+        "    pending.append((os.path.join(root,'Neuron.pending'), os.path.join(root,'Neuron.pyd'), 'Neuron'))\n"
+        "sup = os.path.join(root,'Support')\n"
+        "bases = [root] + ([sup] if os.path.isdir(sup) else [])\n"
+        "for base in bases:\n"
+        "    for dirpath, dirs, files in os.walk(base):\n"
+        "        rel = os.path.relpath(dirpath, root).replace('\\\\','/')\n"
+        "        if rel != '.' and not rel.startswith('Support'):\n"
+        "            dirs[:] = []; continue\n"
+        "        if rel.count('/') > 1:\n"
+        "            dirs[:] = []; continue\n"
+        "        for name in files:\n"
+        "            if not name.endswith('.pending'): continue\n"
+        "            stem = name[:-8]\n"
+        "            pending.append((os.path.join(dirpath, name), os.path.join(dirpath, stem + '.pyd'), stem))\n"
+        "mods = [x[2] for x in pending]\n"
+        "if ui is not None:\n"
+        "    try: ui.set_modules(mods)\n"
+        "    except Exception: pass\n"
+        "total = max(1, len(pending))\n"
+        "for i, (p, t, stem) in enumerate(pending):\n"
+        "    file_frac = float(i) / float(total)\n"
+        "    _prog(0.05 + 0.45 * file_frac, 'Applying module %s/%s...' % (i + 1, total), file_frac, stem + '.pyd')\n"
+        "    if swap(p, t): n += 1\n"
+        "    _prog(0.05 + 0.45 * (float(i + 1) / float(total)), 'Applied %s' % stem, float(i + 1) / float(total), stem + '.pyd')\n"
+        "print('applied', n)\n"
+        "_prog(0.55, 'Checking for major update...', 1.0, '')\n"
+        "major_done = False\n"
+        "need_major = False\n"
+        "try:\n"
+        "    from Support.MajorUpgrade import get_wanted_release\n"
+        "    w = get_wanted_release() or {}\n"
+        "    need_major = str(w.get('status') or '') == 'ready_to_apply'\n"
+        "except Exception:\n"
+        "    need_major = False\n"
+        "if need_major and ui is not None:\n"
+        "    try: ui.close()\n"
+        "    except Exception: pass\n"
+        "    ui = None\n"
+        "try:\n"
+        "    from Support.MajorUpgrade import apply_ready_major_if_any\n"
+        "    ok, msg = apply_ready_major_if_any(force_inplace=True)\n"
+        "    major_done = bool(ok)\n"
+        "    print('major_apply', ok, msg)\n"
+        "except Exception as e:\n"
+        "    print('major_apply_err', e)\n"
+        "if (not major_done) and ui is not None:\n"
+        "    try:\n"
+        "        from Support.ModuleSecurity import get_installed_release_version\n"
+        "        show_ver = str(get_installed_release_version() or new_ver or old_ver or '')\n"
+        "        ui.show_restart_countdown(version=show_ver, seconds=10)\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "if ui is not None:\n"
+        "    try: ui.close()\n"
+        "    except Exception: pass\n"
+    )
+    with open(apply_py_path, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(apply_script)
+
+    # /B = no new console window; pythonw/Neuron.exe are GUI so nothing flashes.
+    start_line = 'start "" /B /D ' + _q(cwd) + ' ' + ' '.join(_q(x) for x in cmd)
+    apply_line = (
+        'set NEURON_OFFLINE_APPLY=1&& ' + _q(apply_py) + ' ' + _q(apply_py_path)
+    )
+
+    # ping used for delay: works under hidden/no-console better than timeout.
+    # After PID is gone, wait longer so the hard-exit reaper finishes, apply
+    # staged .pending modules, then relaunch (fixes "stopped but never restarted").
+    bat = (
+        '@echo off\r\n'
+        f'set "LOG={log_path}"\r\n'
+        'echo relaunch_start %DATE% %TIME%>>"%LOG%"\r\n'
+        f'echo waiting_for_pid {tag}>>"%LOG%"\r\n'
+        'set /a _n=0\r\n'
+        ':waitloop\r\n'
+        f'tasklist /FI "PID eq {tag}" 2>nul | findstr /I /C:"{tag}" >nul\r\n'
+        'if errorlevel 1 goto gone\r\n'
+        'set /a _n+=1\r\n'
+        'if %_n% GEQ 180 (\r\n'
+        '  echo timeout_waiting>>"%LOG%"\r\n'
+        '  goto end\r\n'
+        ')\r\n'
+        'ping -n 2 127.0.0.1 >nul\r\n'
+        'goto waitloop\r\n'
+        ':gone\r\n'
+        'echo pid_gone>>"%LOG%"\r\n'
+        'ping -n 6 127.0.0.1 >nul\r\n'
+        'echo applying_pending>>"%LOG%"\r\n'
+        f'{apply_line} >>"%LOG%" 2>&1\r\n'
+        'ping -n 2 127.0.0.1 >nul\r\n'
+        f'echo launching {start_line}>>"%LOG%"\r\n'
+        f'{start_line}\r\n'
+        'if errorlevel 1 (\r\n'
+        '  echo launch_failed>>"%LOG%"\r\n'
+        ') else (\r\n'
+        '  echo launched_ok>>"%LOG%"\r\n'
+        ')\r\n'
+        f'del /f /q {_q(apply_py_path)} >nul 2>&1\r\n'
+        ':end\r\n'
+        'del "%~f0" >nul 2>&1\r\n'
+    )
+    with open(bat_path, 'w', encoding='ascii', newline='') as f:
+        f.write(bat)
+
+    cmdline = 'cmd.exe /c ' + _q(bat_path)
+
+    if os.name == 'nt':
+        # WMI Create: process parent is WmiPrvSE, not us — survives child-tree kill.
+        try:
+            import win32com.client
+            locator = win32com.client.Dispatch('WbemScripting.SWbemLocator')
+            svc = locator.ConnectServer('.', 'root\\cimv2')
+            startup = svc.Get('Win32_ProcessStartup').SpawnInstance_()
+            startup.ShowWindow = 0  # SW_HIDE
+            proc_class = svc.Get('Win32_Process')
+            in_params = proc_class.Methods_('Create').InParameters.SpawnInstance_()
+            in_params.CommandLine = cmdline
+            in_params.CurrentDirectory = staging
+            in_params.ProcessStartupInformation = startup
+            out = proc_class.ExecMethod_('Create', in_params)
+            rval = int(getattr(out, 'ReturnValue', 1) or 0)
+            new_pid = int(getattr(out, 'ProcessId', 0) or 0)
+            if rval != 0:
+                raise OSError(f'WMI Win32_Process.Create returned {rval}')
+            with open(log_path, 'a', encoding='utf-8') as lf:
+                lf.write(f'wmi_ok pid={new_pid} bat={bat_path} cmd={cmdline}\n')
+            print(f'[RELEASE] Relauncher armed via WMI pid={new_pid} log={log_path}')
+            return
+        except Exception as e:
+            print(f'[RELEASE] WMI relaunch spawn failed ({e}); trying breakaway CreateProcess')
+
+        # Fallback: intermediate cmd runs `start` then exits so the waiter is orphaned
+        # (not in our psutil children list when force_kill runs).
+        import ctypes
+        from ctypes import wintypes
+
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        CREATE_NO_WINDOW = 0x08000000
+        CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+        flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB
+        # start "" breaks parent linkage once this intermediate cmd exits.
+        hop = 'cmd.exe /c start "" /b cmd.exe /c ' + _q(bat_path)
+
+        class STARTUPINFOW(ctypes.Structure):
+            _fields_ = [
+                ('cb', wintypes.DWORD),
+                ('lpReserved', wintypes.LPWSTR),
+                ('lpDesktop', wintypes.LPWSTR),
+                ('lpTitle', wintypes.LPWSTR),
+                ('dwX', wintypes.DWORD),
+                ('dwY', wintypes.DWORD),
+                ('dwXSize', wintypes.DWORD),
+                ('dwYSize', wintypes.DWORD),
+                ('dwXCountChars', wintypes.DWORD),
+                ('dwYCountChars', wintypes.DWORD),
+                ('dwFillAttribute', wintypes.DWORD),
+                ('dwFlags', wintypes.DWORD),
+                ('wShowWindow', wintypes.WORD),
+                ('cbReserved2', wintypes.WORD),
+                ('lpReserved2', ctypes.POINTER(ctypes.c_byte)),
+                ('hStdInput', wintypes.HANDLE),
+                ('hStdOutput', wintypes.HANDLE),
+                ('hStdError', wintypes.HANDLE),
+            ]
+
+        class PROCESS_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ('hProcess', wintypes.HANDLE),
+                ('hThread', wintypes.HANDLE),
+                ('dwProcessId', wintypes.DWORD),
+                ('dwThreadId', wintypes.DWORD),
+            ]
+
+        si = STARTUPINFOW()
+        si.cb = ctypes.sizeof(STARTUPINFOW)
+        pi = PROCESS_INFORMATION()
+        buf = ctypes.create_unicode_buffer(hop)
+        ok = ctypes.windll.kernel32.CreateProcessW(
+            None,
+            buf,
+            None,
+            None,
+            False,
+            flags,
+            None,
+            staging,
+            ctypes.byref(si),
+            ctypes.byref(pi),
+        )
+        if not ok:
+            err = ctypes.GetLastError()
+            raise OSError(f'CreateProcessW failed error={err} cmd={hop}')
+        try:
+            ctypes.windll.kernel32.CloseHandle(pi.hThread)
+            ctypes.windll.kernel32.CloseHandle(pi.hProcess)
+        except Exception:
+            pass
+        # Let the intermediate `start` hop exit so the waiter is orphaned.
+        time.sleep(0.75)
+        with open(log_path, 'a', encoding='utf-8') as lf:
+            lf.write(f'createprocess_ok hop_pid={pi.dwProcessId} bat={bat_path}\n')
+        print(f'[RELEASE] Relauncher armed via CreateProcess hop pid={pi.dwProcessId} log={log_path}')
+        return
+
+    import subprocess
+    subprocess.Popen(
+        ['/bin/sh', '-c', cmdline],
+        cwd=cwd,
+        start_new_session=True,
+        close_fds=True,
+    )
+
+
+def _pythonw_for_relaunch(fallback_exe=None):
+    """Prefer pythonw.exe so relaunch does not open a console window."""
+    import sys
+    candidates = []
+    cur = fallback_exe or sys.executable or ''
+    if cur:
+        candidates.append(cur)
+        low = cur.lower()
+        if low.endswith('python.exe'):
+            candidates.insert(0, cur[:-10] + 'pythonw.exe')
+        elif low.endswith('pythonw.exe'):
+            pass
+        else:
+            candidates.append(os.path.join(os.path.dirname(cur), 'pythonw.exe'))
+    try:
+        from Support.Subprocesses import get_python_executable
+        candidates.append(get_python_executable(use_gui_safe=True))
+    except Exception:
+        pass
+    seen = set()
+    for path in candidates:
+        if not path:
+            continue
+        norm = os.path.normcase(os.path.abspath(path))
+        if norm in seen:
+            continue
+        seen.add(norm)
+        if os.path.isfile(path):
+            return path
+    return cur or 'pythonw.exe'
+
+
+def restart_neuron_application():
+    """
+    Forced update restart:
+    - skip quit confirmation
+    - soft-stop helpers and wait for them to exit
+    - arm a relauncher that starts Neuron only after this PID is gone
+    - close via the normal MainNeuron path (fade + shutdown music, no confirm)
+    """
+    import sys
+    import Support.Header as init
+
+    main_path = getattr(init, 'MAIN_PATH', '') or ''
+    # Compiled installs always prefer Neuron.exe even if a leftover Neuron.py
+    # makes IS_SOURCE_MODE true (that wrongly relaunched via pythonw and died).
+    exe = os.path.join(main_path, 'Neuron.exe')
+    env_launch = (os.environ.get('NEURON_APP_LAUNCH') or '').strip()
+    if env_launch and os.path.isfile(env_launch):
+        launch_cmd = [env_launch]
+    elif os.path.isfile(exe):
+        launch_cmd = [exe]
+    else:
+        launch_cmd = [_pythonw_for_relaunch(), os.path.join(main_path, 'Neuron.py')]
+
+    create_low = 0
+    create_high = 0
+    if os.name == 'nt':
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class FILETIME(ctypes.Structure):
+                _fields_ = [
+                    ('dwLowDateTime', wintypes.DWORD),
+                    ('dwHighDateTime', wintypes.DWORD),
+                ]
+
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            ft_c, ft_e, ft_k, ft_u = FILETIME(), FILETIME(), FILETIME(), FILETIME()
+            if kernel32.GetProcessTimes(
+                kernel32.GetCurrentProcess(),
+                ctypes.byref(ft_c), ctypes.byref(ft_e),
+                ctypes.byref(ft_k), ctypes.byref(ft_u),
+            ):
+                create_low = int(ft_c.dwLowDateTime)
+                create_high = int(ft_c.dwHighDateTime)
+        except Exception:
+            pass
+
+    try:
+        _spawn_update_relauncher(os.getpid(), create_low, create_high, main_path, launch_cmd)
+        # Let ShellExecute/WMI start the bat before we tear down children / ourselves.
+        time.sleep(1.0)
+    except Exception as e:
+        # Never quit without a relauncher — that left peers stopped with patches staged.
+        print(f"[RELEASE] Relauncher spawn failed: {e}")
+        try:
+            init.ending_services = False
+            init.force_quit_no_confirm = False
+            init.update_restart_in_progress = False
+        except Exception:
+            pass
+        try:
+            _show_update_restart_ticker()
+            message = (
+                "     Update staged but auto-restart failed — please restart Neuron manually."
+            )
+            text = (getattr(init, 'taskbar_scrolling_text', None) or '') + (
+                "<span style='color: orange; font-weight: bold;'>" + message + "</span>"
+            )
             tb = getattr(init, 'taskbar', None)
             if tb is not None and hasattr(tb, 'set_tickertape_text'):
                 tb.set_tickertape_text(text)
+        except Exception:
+            pass
+        return
+
+    init.ending_services = True
+    init.force_quit_no_confirm = True
+    init.update_restart_in_progress = True
+
+    try:
+        from Support.Subprocesses import stop_all_subprocesses_graceful
+        stop_all_subprocesses_graceful(timeout_s=20.0)
+    except Exception as e:
+        print(f"[RELEASE] Graceful subprocess stop failed: {e}")
+
+    def _close_main():
+        try:
+            mw = getattr(init, 'mainApplication', None)
+            if mw is not None and hasattr(mw, 'close'):
+                mw.close()
+                return
+        except Exception as e:
+            print(f"[RELEASE] Main window close failed: {e}")
+        try:
+            from PySide6.QtWidgets import QApplication
+            app = QApplication.instance()
+            if app:
+                app.quit()
+        except Exception:
+            pass
+
+    try:
+        from PySide6.QtCore import QTimer, QCoreApplication
+        app = QCoreApplication.instance()
+        if app is not None:
+            QTimer.singleShot(0, _close_main)
+            return
+    except Exception:
+        pass
+    _close_main()
+
+
+def _restart_notice_text():
+    ver = str(_restart_notice_version or '').strip()
+    kind = str(_restart_notice_kind or '').strip().lower()
+    notes = str(_restart_notice_notes or '').strip()
+    if ver and kind == 'major':
+        base = (
+            f"Major update {ver} is ready. Neuron will restart to install it "
+            f"(Neuron.rar). Please wait — do not start Neuron manually."
+        )
+    elif ver:
+        label = 'Patch' if kind == 'patch' else 'Update'
+        base = f"{label} {ver} is ready and will apply on restart."
+    else:
+        base = "An update is ready and will apply on restart."
+    if notes:
+        return f"{base}\n\nNotes: {notes}"
+    return base
+
+
+def _show_update_restart_ticker():
+    try:
+        import Support.Header as init
+        message = "     " + _restart_notice_text()
+        text = (init.taskbar_scrolling_text or '') + (
+            "<span style='color: green; font-weight: bold;'>" + message + "</span>"
+        )
+        tb = getattr(init, 'taskbar', None)
+        if tb is not None and hasattr(tb, 'set_tickertape_text'):
+            tb.set_tickertape_text(text)
+    except Exception:
+        pass
+
+
+def _stop_restart_idle_watcher():
+    global _restart_idle_watcher
+    try:
+        if _restart_idle_watcher is not None:
+            _restart_idle_watcher.stop()
+            _restart_idle_watcher.deleteLater()
+    except Exception:
+        pass
+    _restart_idle_watcher = None
+
+
+def _abort_pending_auto_restart():
+    """User cancelled countdown; keep ticker, do not auto-restart again this session."""
+    global _restart_prompt_active, _restart_countdown_dialog
+    _restart_prompt_active = False
+    _stop_restart_idle_watcher()
+    dlg = _restart_countdown_dialog
+    _restart_countdown_dialog = None
+    if dlg is not None:
+        try:
+            dlg.close()
+            dlg.deleteLater()
+        except Exception:
+            pass
+
+
+def _show_restart_countdown_dialog():
+    """Non-modal 10s countdown + RESTART NOW; then restart_neuron_application()."""
+    global _restart_prompt_active, _restart_countdown_dialog
+    from PySide6.QtCore import QTimer, Qt
+    from PySide6.QtWidgets import (
+        QWidget, QVBoxLayout, QLabel, QPushButton, QApplication, QHBoxLayout
+    )
+    import Support.Header as init
+
+    if _restart_countdown_dialog is not None:
+        return
+
+    _stop_restart_idle_watcher()
+    _restart_prompt_active = True
+    remaining = {'sec': int(UPDATE_RESTART_COUNTDOWN_SECONDS)}
+    ver = str(_restart_notice_version or '').strip()
+
+    parent = (
+        getattr(init, 'mainApplication', None)
+        or getattr(init, 'main_window', None)
+        or QApplication.activeWindow()
+    )
+    dlg = QWidget(parent)
+    dlg.setWindowTitle("Neuron update")
+    dlg.setWindowFlags(
+        Qt.WindowType.Tool
+        | Qt.WindowType.WindowStaysOnTopHint
+        | Qt.WindowType.FramelessWindowHint
+    )
+    dlg.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+    dlg.setStyleSheet(
+        "QWidget { background-color: #1e1e1e; color: #f0f0f0; border: 1px solid #4a90e2; "
+        "border-radius: 8px; }"
+        "QLabel { border: none; font-size: 13px; }"
+        "QPushButton { background-color: #2e7d32; color: white; font-weight: bold; "
+        "padding: 8px 16px; border-radius: 4px; }"
+    )
+    lay = QVBoxLayout(dlg)
+    lay.setContentsMargins(16, 16, 16, 16)
+    if ver:
+        title = QLabel(
+            "You've updated to version %s! Restarting now.\n\n%s" % (ver, _restart_notice_text())
+        )
+    else:
+        title = QLabel(_restart_notice_text())
+    title.setWordWrap(True)
+    lay.addWidget(title)
+    countdown_lbl = QLabel("")
+    countdown_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    countdown_lbl.setStyleSheet("font-size: 18px; font-weight: bold; color: #7CFC00; border: none;")
+    lay.addWidget(countdown_lbl)
+    btn_row = QHBoxLayout()
+    btn_now = QPushButton("RESTART NOW")
+    btn_row.addStretch()
+    btn_row.addWidget(btn_now)
+    btn_row.addStretch()
+    lay.addLayout(btn_row)
+
+    timer = QTimer(dlg)
+    timer.setInterval(1000)
+
+    def _update_label():
+        countdown_lbl.setText(f"Restarting in {remaining['sec']} seconds...")
+
+    def _do_restart():
+        timer.stop()
+        try:
+            dlg.hide()
+        except Exception:
+            pass
+        restart_neuron_application()
+
+    def _tick():
+        remaining['sec'] -= 1
+        if remaining['sec'] <= 0:
+            _do_restart()
+            return
+        _update_label()
+
+    btn_now.clicked.connect(_do_restart)
+    timer.timeout.connect(_tick)
+    _update_label()
+    timer.start()
+
+    dlg.adjustSize()
+    dlg.resize(max(dlg.width(), 420), max(dlg.height(), 160))
+    screen = QApplication.primaryScreen()
+    if screen:
+        geo = screen.availableGeometry()
+        dlg.move(geo.right() - dlg.width() - 24, geo.bottom() - dlg.height() - 24)
+    dlg.show()
+    _restart_countdown_dialog = dlg
+
+
+def _arm_or_show_auto_restart(force_countdown=False):
+    """If idle long enough (or force_countdown), show countdown; else poll until idle."""
+    global _restart_idle_watcher, _restart_prompt_active
+    from PySide6.QtCore import QTimer
+
+    if _restart_countdown_dialog is not None:
+        return
+    if force_countdown or _user_idle_seconds() >= float(UPDATE_RESTART_IDLE_SECONDS):
+        _show_restart_countdown_dialog()
+        return
+
+    if _restart_idle_watcher is not None:
+        return
+
+    _restart_prompt_active = True
+    watcher = QTimer()
+    watcher.setInterval(int(UPDATE_RESTART_IDLE_POLL_MS))
+
+    def _poll():
+        if _restart_countdown_dialog is not None:
+            _stop_restart_idle_watcher()
+            return
+        if _user_idle_seconds() >= float(UPDATE_RESTART_IDLE_SECONDS):
+            _show_restart_countdown_dialog()
+
+    watcher.timeout.connect(_poll)
+    watcher.start()
+    _restart_idle_watcher = watcher
+
+
+def _notify_release_restart(force_countdown=False, version='', kind='', notes=''):
+    """
+    Module/package staged: always show green tickertape.
+    If force_countdown (admin module deploy) or the user has been idle for
+    UPDATE_RESTART_IDLE_SECONDS, show a non-modal countdown + RESTART NOW.
+    """
+    global _restart_notice_version, _restart_notice_kind, _restart_notice_notes
+    if version:
+        _restart_notice_version = str(version)
+    if kind:
+        _restart_notice_kind = str(kind)
+    if notes is not None and str(notes).strip():
+        _restart_notice_notes = str(notes).strip()
+    try:
+        from PySide6.QtCore import QTimer, QCoreApplication
+
+        def _apply():
+            _show_update_restart_ticker()
+            _arm_or_show_auto_restart(force_countdown=bool(force_countdown))
 
         app = QCoreApplication.instance()
         if app is not None:
@@ -3383,14 +5563,22 @@ def validate_all_modules(modules_db_data: List[Tuple], main_path: str) -> Dict[s
                 module_path = os.path.join(main_path, f"{module_name}.pyd")
                 pending_path = os.path.join(main_path, f"{module_name}.pending")
             
-            # Check if .pending file exists and needs to be finalized
-            if os.path.exists(pending_path) and not os.path.exists(module_path):
+            # Finalize .pending even when an older .pyd still exists; also wipe
+            # name.cp312-win_amd64.pyd so Python cannot load the stale tagged binary.
+            if os.path.exists(pending_path):
                 if verify_module_integrity(pending_path, checksum):
                     try:
+                        module_dir = os.path.dirname(module_path) or main_path
+                        remove_stale_module_binaries(module_dir, module_name)
+                        if os.path.exists(module_path):
+                            try:
+                                os.remove(module_path)
+                            except Exception:
+                                pass
                         os.rename(pending_path, module_path)
                         validation_results[module_name] = True
                         continue
-                    except Exception as e:
+                    except Exception:
                         validation_results[module_name] = False
                         continue
                 else:
@@ -3401,9 +5589,35 @@ def validate_all_modules(modules_db_data: List[Tuple], main_path: str) -> Dict[s
             if not os.path.exists(module_path):
                 validation_results[module_name] = False
                 continue
+
+            remove_stale_module_binaries(
+                os.path.dirname(module_path) or main_path, module_name, keep_path=module_path)
             
             # Verify integrity
             is_valid = verify_module_integrity(module_path, checksum)
+            # FrontendVault is a matched pair with System/frontend.vault. A manual
+            # vault rebuild changes the .pyd hash; treating that as "corrupt" and
+            # restoring System/Bak overwrites the good binary with the old key.
+            if (not is_valid) and module_name == 'FrontendVault':
+                vault_path = os.path.join(main_path, 'System', 'frontend.vault')
+                if _frontend_vault_decrypts(module_path, vault_path):
+                    try:
+                        with open(module_path, 'rb') as fh:
+                            new_crc = _calculate_crc(fh.read())
+                        from Support.Utils import query_database
+                        from Support.Header import pool_main_db
+                        query_database(
+                            pool_main_db,
+                            "UPDATE Modules SET checksum = ?, size = ? WHERE name = ?",
+                            (new_crc, str(os.path.getsize(module_path)), module_name),
+                        )
+                        print(
+                            "[MODULE_SECURITY] FrontendVault checksum refreshed "
+                            "(decrypts current frontend.vault) — skip Bak restore"
+                        )
+                    except Exception as e:
+                        print(f"[MODULE_SECURITY] FrontendVault checksum refresh failed: {e}")
+                    is_valid = True
             validation_results[module_name] = is_valid
             
             if not is_valid:
@@ -3438,6 +5652,16 @@ def restore_corrupted_modules(validation_results: Dict[str, bool],
     
     # Get list of corrupted modules
     corrupted_modules = [name for name, is_valid in validation_results.items() if not is_valid]
+    # Never Bak-restore FrontendVault over a binary that opens the current vault.
+    if 'FrontendVault' in corrupted_modules:
+        fv_path = os.path.join(main_path, 'Support', 'FrontendVault.pyd')
+        vault_path = os.path.join(main_path, 'System', 'frontend.vault')
+        if _frontend_vault_decrypts(fv_path, vault_path):
+            corrupted_modules = [n for n in corrupted_modules if n != 'FrontendVault']
+            print(
+                "[MODULE_SECURITY] Skipping FrontendVault Bak restore "
+                "(current pyd decrypts frontend.vault)"
+            )
     
     if not corrupted_modules:
         print("[MODULE_SECURITY] No corrupted modules found")
@@ -3495,14 +5719,30 @@ def restore_corrupted_modules(validation_results: Dict[str, bool],
                         
                         # Try to decrypt filename
                         decrypted_name = decrypt(encrypted_filename)
-                        
-                        if module_name in decrypted_name:
-                            # Found matching backup
-                            success = restore_module_from_backup(backup_file, backup_folder, dest_path)
-                            if success:
-                                restored_modules.append(module_name)
-                                restored = True
-                                break
+                        # Exact stem match only. Substring "Phone" in "PhoneUtil.pyd"
+                        # previously restored the wrong .bak into Phone.pyd (PyInit_Phone).
+                        bak_base = os.path.basename(str(decrypted_name or '').replace('\\', '/'))
+                        bak_stem = os.path.splitext(bak_base)[0]
+                        if bak_stem != module_name:
+                            continue
+                        bak_path = os.path.join(backup_folder, backup_file)
+                        try:
+                            with open(bak_path, 'rb') as bf:
+                                bak_bytes = bf.read(min(os.path.getsize(bak_path), 2 * 1024 * 1024))
+                        except Exception:
+                            continue
+                        export_marker = ('PyInit_' + module_name).encode('ascii')
+                        if export_marker not in bak_bytes:
+                            print(
+                                f"[MODULE_SECURITY] Skip Bak for {module_name}: "
+                                f"missing {export_marker.decode('ascii', 'ignore')}"
+                            )
+                            continue
+                        success = restore_module_from_backup(backup_file, backup_folder, dest_path)
+                        if success:
+                            restored_modules.append(module_name)
+                            restored = True
+                            break
                     except:
                         # If decryption fails, try next file
                         continue
